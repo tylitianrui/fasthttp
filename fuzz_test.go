@@ -42,30 +42,38 @@ func FuzzVisitHeaderParams(f *testing.F) {
 func FuzzResponseReadLimitBody(f *testing.F) {
 	f.Add([]byte("HTTP/1.1 200 OK\r\nContent-Type: aa\r\nContent-Length: 10\r\n\r\n9876543210"), 1024)
 
-	f.Fuzz(func(t *testing.T, body []byte, max int) {
-		// Don't do bodies bigger than 10kb.
-		max = max % (10 * 1024)
+	f.Fuzz(func(t *testing.T, body []byte, maxBodySize int) {
+		if len(body) > 1024*1024 || maxBodySize > 1024*1024 {
+			return
+		}
+		// Only test with a max for the body, otherwise a very large Content-Length will just OOM.
+		if maxBodySize <= 0 {
+			return
+		}
 
-		var res Response
+		res := AcquireResponse()
+		defer ReleaseResponse(res)
 
-		_ = res.ReadLimitBody(bufio.NewReader(bytes.NewReader(body)), max)
-		w := bytes.Buffer{}
-		_, _ = res.WriteTo(&w)
+		_ = res.ReadLimitBody(bufio.NewReader(bytes.NewReader(body)), maxBodySize)
 	})
 }
 
 func FuzzRequestReadLimitBody(f *testing.F) {
 	f.Add([]byte("POST /a HTTP/1.1\r\nHost: a.com\r\nTransfer-Encoding: chunked\r\nContent-Type: aa\r\n\r\n6\r\nfoobar\r\n3\r\nbaz\r\n0\r\nfoobar\r\n\r\n"), 1024)
 
-	f.Fuzz(func(t *testing.T, body []byte, max int) {
-		// Don't do bodies bigger than 10kb.
-		max = max % (10 * 1024)
+	f.Fuzz(func(t *testing.T, body []byte, maxBodySize int) {
+		if len(body) > 1024*1024 || maxBodySize > 1024*1024 {
+			return
+		}
+		// Only test with a max for the body, otherwise a very large Content-Length will just OOM.
+		if maxBodySize <= 0 {
+			return
+		}
 
-		var req Request
+		req := AcquireRequest()
+		defer ReleaseRequest(req)
 
-		_ = req.ReadLimitBody(bufio.NewReader(bytes.NewReader(body)), max)
-		w := bytes.Buffer{}
-		_, _ = req.WriteTo(&w)
+		_ = req.ReadLimitBody(bufio.NewReader(bytes.NewReader(body)), maxBodySize)
 	})
 }
 
