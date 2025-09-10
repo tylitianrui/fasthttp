@@ -160,36 +160,6 @@ func TestIssue1808(t *testing.T) {
 	}
 }
 
-func TestResponseHeaderMultiLineName(t *testing.T) {
-	t.Parallel()
-
-	s := "HTTP/1.1 200 OK\r\n" +
-		"Host: go.dev\r\n" +
-		"Gopher-New-\r\n" +
-		" Line: This is a header on multiple lines\r\n" +
-		"\r\n"
-	header := new(ResponseHeader)
-	if _, err := header.parse([]byte(s)); err != errInvalidName {
-		m := make(map[string]string)
-		header.VisitAll(func(key, value []byte) {
-			m[string(key)] = string(value)
-		})
-		t.Errorf("expected error, got %q (%v)", m, err)
-	}
-
-	if !bytes.Equal(header.StatusMessage(), []byte("OK")) {
-		t.Errorf("expected default status line, got: %q", header.StatusMessage())
-	}
-
-	if !bytes.Equal(header.Protocol(), []byte("HTTP/1.1")) {
-		t.Errorf("expected default protocol, got: %q", header.Protocol())
-	}
-
-	if !bytes.Equal(header.appendStatusLine(nil), []byte("HTTP/1.1 200 OK\r\n")) {
-		t.Errorf("parse status line with non-default value failed, got: %q want: HTTP/1.1 200 OK", header.Protocol())
-	}
-}
-
 func TestResponseHeaderMultiLinePanicked(t *testing.T) {
 	t.Parallel()
 
@@ -425,6 +395,7 @@ func TestRequestRawHeaders(t *testing.T) {
 func TestRequestDisableSpecialHeaders(t *testing.T) {
 	t.Parallel()
 
+	// Test original header functionality
 	kvs := "Host: foobar\r\n" +
 		"User-Agent: ua\r\n" +
 		"Non-Special: val\r\n" +
@@ -448,6 +419,90 @@ func TestRequestDisableSpecialHeaders(t *testing.T) {
 	}
 	if h.String() != "GET / HTTP/1.0\r\nHost: foobar\r\nUser-Agent: ua\r\nNon-Special: val\r\nhost: notfoobar\r\n\r\n" {
 		t.Fatalf("custom special header ordering failed: %q", h.String())
+	}
+
+	// Test body parsing with DisableSpecialHeader - should work correctly after fix
+	testBody := "a=b&test=123"
+	rawRequest := "POST /test HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Content-Type: application/x-www-form-urlencoded\r\n" +
+		"Content-Length: " + strconv.Itoa(len(testBody)) + "\r\n" +
+		"\r\n" +
+		testBody
+
+	var req Request
+	req.Header.DisableSpecialHeader()
+
+	br2 := bufio.NewReader(bytes.NewBufferString(rawRequest))
+	if err := req.ReadLimitBody(br2, 0); err != nil {
+		t.Fatalf("unexpected error reading request: %v", err)
+	}
+
+	// Verify Content-Length is correctly parsed with DisableSpecialHeader
+	if req.Header.ContentLength() != len(testBody) {
+		t.Fatalf("ContentLength() incorrect with DisableSpecialHeader: got %d, expected %d",
+			req.Header.ContentLength(), len(testBody))
+	}
+
+	// Verify body is preserved with DisableSpecialHeader
+	if string(req.Body()) != testBody {
+		t.Fatalf("body content incorrect with DisableSpecialHeader: got %q, expected %q",
+			string(req.Body()), testBody)
+	}
+}
+
+func TestRequestDisableSpecialHeadersChunked(t *testing.T) {
+	t.Parallel()
+
+	testBody := "chunked-test"
+	rawRequest := "POST /test HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"\r\n" +
+		"c\r\n" +
+		testBody + "\r\n" +
+		"0\r\n\r\n"
+
+	var req Request
+	req.Header.DisableSpecialHeader()
+
+	br := bufio.NewReader(bytes.NewBufferString(rawRequest))
+	if err := req.ReadLimitBody(br, 0); err != nil {
+		t.Fatalf("unexpected error reading chunked request: %v", err)
+	}
+
+	// Verify chunked encoding is detected
+	if req.Header.ContentLength() != -1 {
+		t.Fatalf("chunked encoding not detected with DisableSpecialHeader: got %d, expected -1",
+			req.Header.ContentLength())
+	}
+
+	// Verify chunked body is preserved
+	if string(req.Body()) != testBody {
+		t.Fatalf("chunked body incorrect with DisableSpecialHeader: got %q, expected %q",
+			string(req.Body()), testBody)
+	}
+}
+
+func TestRequestDisableSpecialHeadersIdentity(t *testing.T) {
+	t.Parallel()
+
+	rawRequest := "GET /test HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"\r\n"
+
+	var req Request
+	req.Header.DisableSpecialHeader()
+
+	br := bufio.NewReader(bytes.NewBufferString(rawRequest))
+	if err := req.ReadLimitBody(br, 0); err != nil {
+		t.Fatalf("unexpected error reading identity request: %v", err)
+	}
+
+	// Verify identity encoding is detected
+	if req.Header.ContentLength() != -2 {
+		t.Fatalf("identity encoding not detected with DisableSpecialHeader: got %d, expected -2",
+			req.Header.ContentLength())
 	}
 }
 
@@ -530,7 +585,7 @@ func TestResponseHeaderAdd(t *testing.T) {
 		t.Fatalf("unexpected header len %d. Expecting 12", h.Len())
 	}
 
-	h.VisitAll(func(k, v []byte) {
+	for k, v := range h.All() {
 		switch string(k) {
 		case "Aaa", "Foo-Bar", "Content-Type":
 			if _, ok := m[string(v)]; !ok {
@@ -540,7 +595,7 @@ func TestResponseHeaderAdd(t *testing.T) {
 		default:
 			t.Fatalf("unexpected key found: %q", k)
 		}
-	})
+	}
 	if len(m) > 0 {
 		t.Fatalf("%d headers are missed", len(m))
 	}
@@ -552,14 +607,14 @@ func TestResponseHeaderAdd(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	h.VisitAll(func(k, v []byte) {
+	for k, v := range h.All() {
 		switch string(k) {
 		case "Aaa", "Foo-Bar", "Content-Type":
 			m[string(v)] = struct{}{}
 		default:
 			t.Fatalf("unexpected key found: %q", k)
 		}
-	})
+	}
 	if len(m) != 12 {
 		t.Fatalf("unexpected number of headers: %d. Expecting 12", len(m))
 	}
@@ -583,7 +638,7 @@ func TestRequestHeaderAdd(t *testing.T) {
 		t.Fatalf("unexpected header len %d. Expecting 12", h.Len())
 	}
 
-	h.VisitAll(func(k, v []byte) {
+	for k, v := range h.All() {
 		switch string(k) {
 		case "Aaa", "Foo-Bar", "User-Agent":
 			if _, ok := m[string(v)]; !ok {
@@ -593,7 +648,7 @@ func TestRequestHeaderAdd(t *testing.T) {
 		default:
 			t.Fatalf("unexpected key found: %q", k)
 		}
-	})
+	}
 	if len(m) > 0 {
 		t.Fatalf("%d headers are missed", len(m))
 	}
@@ -605,14 +660,14 @@ func TestRequestHeaderAdd(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	h.VisitAll(func(k, v []byte) {
+	for k, v := range h.All() {
 		switch string(k) {
 		case "Aaa", "Foo-Bar", "User-Agent":
 			m[string(v)] = struct{}{}
 		default:
 			t.Fatalf("unexpected key found: %q", k)
 		}
-	})
+	}
 	if len(m) != 12 {
 		t.Fatalf("unexpected number of headers: %d. Expecting 12", len(m))
 	}
@@ -799,7 +854,7 @@ func TestResponseHeaderSetTrailerGetBytes(t *testing.T) {
 	}
 
 	if string(headerBytes[n:]) != "Foo: bar\r\nTrailer: Baz\r\n\r\n" {
-		t.Fatalf("Unexpected header: %q. Expected %q", headerBytes[n:], "Foo: bar\nTrailer: Baz\n\n")
+		t.Fatalf("Unexpected header: %q. Expected %q", headerBytes[n:], "Foo: bar\r\nTrailer: Baz\r\n\r\n")
 	}
 	if string(h.TrailerHeader()) != "Baz: test\r\n\r\n" {
 		t.Fatalf("Unexpected trailer header: %q. Expected %q", h.TrailerHeader(), "Baz: test\r\n\r\n")
@@ -821,7 +876,7 @@ func TestRequestHeaderSetTrailerGetBytes(t *testing.T) {
 	}
 
 	if string(headerBytes[n:]) != "Foo: bar\r\nTrailer: Baz\r\n\r\n" {
-		t.Fatalf("Unexpected header: %q. Expected %q", headerBytes[n:], "Foo: bar\nTrailer: Baz\n\n")
+		t.Fatalf("Unexpected header: %q. Expected %q", headerBytes[n:], "Foo: bar\nTrailer: Baz\r\n\r\n")
 	}
 	if string(h.TrailerHeader()) != "Baz: test\r\n\r\n" {
 		t.Fatalf("Unexpected trailer header: %q. Expected %q", h.TrailerHeader(), "Baz: test\r\n\r\n")
@@ -1893,6 +1948,175 @@ func TestRequestHeaderAddTrailerError(t *testing.T) {
 	}
 }
 
+// Security tests for trailer handling vulnerability fix.
+func TestTrailerSecurityVulnerabilityFix(t *testing.T) {
+	t.Parallel()
+
+	// Test cases for headers that should be blocked in trailers
+	dangerousHeaders := []struct {
+		name        string
+		header      string
+		description string
+	}{
+		{"Content-Type", "Content-Type", "off-by-one fix: exactly 'Content-Type' should be blocked"},
+		{"Cookie", "Cookie", "session hijacking prevention"},
+		{"Set-Cookie", "Set-Cookie", "session hijacking prevention"},
+		{"Location", "Location", "redirect attack prevention"},
+		{"X-Forwarded-For", "X-Forwarded-For", "IP spoofing prevention"},
+		{"X-Forwarded-Host", "X-Forwarded-Host", "IP spoofing prevention"},
+		{"X-Forwarded-Proto", "X-Forwarded-Proto", "IP spoofing prevention"},
+		{"X-Real-IP", "X-Real-IP", "IP spoofing prevention"},
+		{"X-Real-Ip", "X-Real-Ip", "IP spoofing prevention (case insensitive)"},
+		{"Authorization", "Authorization", "auth bypass prevention"},
+		{"Host", "Host", "host header attack prevention"},
+		{"Connection", "Connection", "connection control prevention"},
+	}
+
+	// Test RequestHeader AddTrailer blocking dangerous headers.
+	for _, tc := range dangerousHeaders {
+		t.Run("RequestHeader_"+tc.name, func(t *testing.T) {
+			var h RequestHeader
+			err := h.AddTrailer(tc.header)
+			if !errors.Is(err, ErrBadTrailer) {
+				t.Fatalf("Expected ErrBadTrailer for %s (%s), got: %v", tc.header, tc.description, err)
+			}
+
+			// Verify trailer header is empty since the dangerous header was rejected
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != "" {
+				t.Fatalf("Expected empty trailer after rejecting %s, got: %q", tc.header, trailer)
+			}
+		})
+	}
+
+	// Test ResponseHeader AddTrailer blocking dangerous headers
+	for _, tc := range dangerousHeaders {
+		t.Run("ResponseHeader_"+tc.name, func(t *testing.T) {
+			var h ResponseHeader
+			err := h.AddTrailer(tc.header)
+
+			if !errors.Is(err, ErrBadTrailer) {
+				t.Fatalf("Expected ErrBadTrailer for %s (%s), got: %v", tc.header, tc.description, err)
+			}
+
+			// Verify trailer header is empty since the dangerous header was rejected
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != "" {
+				t.Fatalf("Expected empty trailer after rejecting %s, got: %q", tc.header, trailer)
+			}
+		})
+	}
+
+	// Test that safe headers are still allowed
+	safeHeaders := []string{"Foo", "X-Custom-Safe", "My-App-Trailer", "Debug-Info"}
+
+	for _, header := range safeHeaders {
+		t.Run("Safe_RequestHeader_"+header, func(t *testing.T) {
+			var h RequestHeader
+			err := h.AddTrailer(header)
+			if err != nil {
+				t.Fatalf("Expected no error for safe header %s, got: %v", header, err)
+			}
+
+			// Verify the safe header was added to trailer
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != header {
+				t.Fatalf("Expected trailer %q for safe header, got: %q", header, trailer)
+			}
+		})
+
+		t.Run("Safe_ResponseHeader_"+header, func(t *testing.T) {
+			var h ResponseHeader
+			err := h.AddTrailer(header)
+			if err != nil {
+				t.Fatalf("Expected no error for safe header %s, got: %v", header, err)
+			}
+
+			// Verify the safe header was added to trailer
+			if trailer := string(h.Peek(HeaderTrailer)); trailer != header {
+				t.Fatalf("Expected trailer %q for safe header, got: %q", header, trailer)
+			}
+		})
+	}
+}
+
+func TestTrailerParsingSecurityFix(t *testing.T) {
+	t.Parallel()
+
+	// Test the specific vulnerability scenario: malicious trailers should be rejected
+	// Test that dangerous trailers in chunked body are properly blocked
+
+	dangerousTrailers := []string{
+		"Content-Type: text/malicious\r\n\r\n",
+		"X-Forwarded-For: attacker.com\r\n\r\n",
+		"X-Real-IP: 1.1.1.1\r\n\r\n",
+		"Cookie: evil\r\n\r\n",
+		"Location: http://evil.com\r\n\r\n",
+	}
+
+	for i, trailer := range dangerousTrailers {
+		t.Run("Request_"+strconv.Itoa(i), func(t *testing.T) {
+			var h RequestHeader
+			r := bytes.NewBufferString(trailer)
+			br := bufio.NewReader(r)
+
+			err := h.ReadTrailer(br)
+			if err == nil {
+				t.Fatalf("Expected error when reading dangerous trailer, but got none: %s", trailer)
+			}
+
+			// The error should mention forbidden trailer
+			if !strings.Contains(err.Error(), "forbidden trailer") {
+				t.Fatalf("Expected 'forbidden trailer' error for %s, got: %v", trailer, err)
+			}
+		})
+
+		t.Run("Response_"+strconv.Itoa(i), func(t *testing.T) {
+			var h ResponseHeader
+			r := bytes.NewBufferString(trailer)
+			br := bufio.NewReader(r)
+
+			err := h.ReadTrailer(br)
+			if err == nil {
+				t.Fatalf("Expected error when reading dangerous trailer, but got none: %s", trailer)
+			}
+
+			// The error should mention forbidden trailer
+			if !strings.Contains(err.Error(), "forbidden trailer") {
+				t.Fatalf("Expected 'forbidden trailer' error for %s, got: %v", trailer, err)
+			}
+		})
+	}
+
+	// Test that safe trailers still work
+	safeTrailers := []string{
+		"Foo: bar\r\n\r\n",
+		"X-Custom-Header: value\r\n\r\n",
+		"Debug-Info: test\r\n\r\n",
+	}
+
+	for i, trailer := range safeTrailers {
+		t.Run("Safe_Request_"+strconv.Itoa(i), func(t *testing.T) {
+			var h RequestHeader
+			r := bytes.NewBufferString(trailer)
+			br := bufio.NewReader(r)
+
+			err := h.ReadTrailer(br)
+			if err != nil && err != io.EOF {
+				t.Fatalf("Expected no error for safe trailer %s, got: %v", trailer, err)
+			}
+		})
+
+		t.Run("Safe_Response_"+strconv.Itoa(i), func(t *testing.T) {
+			var h ResponseHeader
+			r := bytes.NewBufferString(trailer)
+			br := bufio.NewReader(r)
+
+			err := h.ReadTrailer(br)
+			if err != nil && err != io.EOF {
+				t.Fatalf("Expected no error for safe trailer %s, got: %v", trailer, err)
+			}
+		})
+	}
+}
+
 func TestResponseHeaderCookie(t *testing.T) {
 	t.Parallel()
 
@@ -1933,7 +2157,7 @@ func TestResponseHeaderCookie(t *testing.T) {
 		t.Fatalf("unexpected cookie\n%v\nExpected\n%v\n", &c, &expectedC2)
 	}
 
-	h.VisitAllCookie(func(key, value []byte) {
+	for key, value := range h.Cookies() {
 		var cc Cookie
 		if err := cc.ParseBytes(value); err != nil {
 			t.Fatal(err)
@@ -1953,7 +2177,7 @@ func TestResponseHeaderCookie(t *testing.T) {
 		default:
 			t.Fatalf("unexpected cookie key %q", key)
 		}
-	})
+	}
 
 	w := &bytes.Buffer{}
 	bw := bufio.NewWriter(w)
@@ -2094,11 +2318,12 @@ func TestResponseHeaderCookieIssue4(t *testing.T) {
 		t.Fatalf("Unexpected Set-Cookie header %q. Expected %q", h.Peek(HeaderSetCookie), "foo=bar")
 	}
 	cookieSeen := false
-	h.VisitAll(func(key, _ []byte) {
+	for key := range h.All() {
 		if string(key) == HeaderSetCookie {
 			cookieSeen = true
+			break
 		}
-	})
+	}
 	if !cookieSeen {
 		t.Fatalf("Set-Cookie not present in VisitAll")
 	}
@@ -2114,11 +2339,12 @@ func TestResponseHeaderCookieIssue4(t *testing.T) {
 		t.Fatalf("Unexpected Set-Cookie header %q. Expected %q", h.Peek(HeaderSetCookie), "foo=bar")
 	}
 	cookieSeen = false
-	h.VisitAll(func(key, _ []byte) {
+	for key := range h.All() {
 		if string(key) == HeaderSetCookie {
 			cookieSeen = true
+			break
 		}
-	})
+	}
 	if !cookieSeen {
 		t.Fatalf("Set-Cookie not present in VisitAll")
 	}
@@ -2137,11 +2363,12 @@ func TestRequestHeaderCookieIssue313(t *testing.T) {
 		t.Fatalf("Unexpected Cookie header %q. Expected %q", h.Peek(HeaderCookie), "foo=bar")
 	}
 	cookieSeen := false
-	h.VisitAll(func(key, _ []byte) {
+	for key := range h.All() {
 		if string(key) == HeaderCookie {
 			cookieSeen = true
+			break
 		}
-	})
+	}
 	if !cookieSeen {
 		t.Fatalf("Cookie not present in VisitAll")
 	}
@@ -2154,11 +2381,12 @@ func TestRequestHeaderCookieIssue313(t *testing.T) {
 		t.Fatalf("Unexpected Cookie header %q. Expected %q", h.Peek(HeaderCookie), "foo=bar")
 	}
 	cookieSeen = false
-	h.VisitAll(func(key, _ []byte) {
+	for key := range h.All() {
 		if string(key) == HeaderCookie {
 			cookieSeen = true
+			break
 		}
-	})
+	}
 	if !cookieSeen {
 		t.Fatalf("Cookie not present in VisitAll")
 	}
@@ -2494,15 +2722,19 @@ func TestResponseHeaderReadSuccess(t *testing.T) {
 		300, 123, "text/html")
 
 	// lf instead of crlf
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\nContent-Length: 123\nContent-Type: text/html\n\n",
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 123\r\nContent-Type: text/html\r\n\r\n",
 		200, 123, "text/html")
 
 	// No space after colon
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\nContent-Length:34\nContent-Type: sss\n\naaaa",
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\nContent-Length:34\nContent-Type: sss\r\n\r\naaaa",
 		200, 34, "sss")
 
+	// space in multiline value with \r\n\r\n as body separator
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 200 OK\r\nContent-Length: 34\r\nContent-Type: sss\r\n vvv\r\n\r\naaaa",
+		200, 34, "sss vvv")
+
 	// invalid case
-	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 400 OK\nconTEnt-leNGTH: 123\nConTENT-TYPE: ass\n\n",
+	testResponseHeaderReadSuccess(t, h, "HTTP/1.1 400 OK\nconTEnt-leNGTH: 123\nConTENT-TYPE: ass\r\n\r\n",
 		400, 123, "ass")
 
 	// duplicate content-length
@@ -2650,32 +2882,28 @@ func TestRequestHeaderReadSuccess(t *testing.T) {
 		t.Fatalf("unexpected connection: close")
 	}
 
-	// lf instead of crlf
-	testRequestHeaderReadSuccess(t, h, "GET /foo/bar HTTP/1.1\nHost: google.com\n\n",
-		-2, "/foo/bar", "google.com", "", "")
-
 	// post method
 	testRequestHeaderReadSuccess(t, h, "POST /aaa?bbb HTTP/1.1\r\nHost: foobar.com\r\nContent-Length: 1235\r\nContent-Type: aaa\r\n\r\nabcdef",
 		1235, "/aaa?bbb", "foobar.com", "", "aaa")
 
 	// no space after colon
-	testRequestHeaderReadSuccess(t, h, "GET /a HTTP/1.1\nHost:aaaxd\n\nsdfds",
+	testRequestHeaderReadSuccess(t, h, "GET /a HTTP/1.1\r\nHost:aaaxd\r\n\r\nsdfds",
 		-2, "/a", "aaaxd", "", "")
 
 	// get with zero content-length
-	testRequestHeaderReadSuccess(t, h, "GET /xxx HTTP/1.1\nHost: aaa.com\nContent-Length: 0\n\n",
+	testRequestHeaderReadSuccess(t, h, "GET /xxx HTTP/1.1\r\nHost: aaa.com\nContent-Length: 0\r\n\r\n",
 		0, "/xxx", "aaa.com", "", "")
 
 	// get with non-zero content-length
-	testRequestHeaderReadSuccess(t, h, "GET /xxx HTTP/1.1\nHost: aaa.com\nContent-Length: 123\n\n",
+	testRequestHeaderReadSuccess(t, h, "GET /xxx HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 123\r\n\r\n",
 		123, "/xxx", "aaa.com", "", "")
 
 	// invalid case
-	testRequestHeaderReadSuccess(t, h, "GET /aaa HTTP/1.1\nhoST: bbb.com\n\naas",
+	testRequestHeaderReadSuccess(t, h, "GET /aaa HTTP/1.1\r\nhoST: bbb.com\r\n\r\naas",
 		-2, "/aaa", "bbb.com", "", "")
 
 	// referer
-	testRequestHeaderReadSuccess(t, h, "GET /asdf HTTP/1.1\nHost: aaa.com\nReferer: bb.com\n\naaa",
+	testRequestHeaderReadSuccess(t, h, "GET /asdf HTTP/1.1\r\nHost: aaa.com\r\nReferer: bb.com\r\n\r\naaa",
 		-2, "/asdf", "aaa.com", "bb.com", "")
 
 	// duplicate host
@@ -2706,9 +2934,8 @@ func TestRequestHeaderReadSuccess(t *testing.T) {
 	testRequestHeaderReadSuccess(t, h, "\r\n\n\r\nGET /aaa HTTP/1.1\r\nHost: aaa.com\r\n\r\nsss",
 		-2, "/aaa", "aaa.com", "", "")
 
-	// request uri with spaces
-	testRequestHeaderReadSuccess(t, h, "GET /foo/ bar baz HTTP/1.1\r\nHost: aa.com\r\n\r\nxxx",
-		-2, "/foo/ bar baz", "aa.com", "", "")
+	// request uri with spaces - should be rejected per RFC 9112
+	testRequestHeaderReadError(t, h, "GET /foo/ bar baz HTTP/1.1\r\nHost: aa.com\r\n\r\nxxx")
 
 	// no host
 	testRequestHeaderReadSuccess(t, h, "GET /foo/bar HTTP/1.1\r\nFOObar: assdfd\r\n\r\naaa",
@@ -2772,14 +2999,16 @@ func TestResponseHeaderReadError(t *testing.T) {
 
 	// zero-length headers
 	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\n: zero-key\r\n\r\n")
+
+	// Space before header name
+	testResponseHeaderReadError(t, h, "HTTP/1.1 200 OK\r\n foo: bar\r\n\r\n")
 }
 
 func TestResponseHeaderReadErrorSecureLog(t *testing.T) {
 	t.Parallel()
 
-	h := &ResponseHeader{
-		secureErrorLogMessage: true,
-	}
+	h := &ResponseHeader{}
+	h.secureErrorLogMessage = true
 
 	// incorrect first line
 	testResponseHeaderReadSecuredError(t, h, "fo")
@@ -2828,14 +3057,16 @@ func TestRequestHeaderReadError(t *testing.T) {
 
 	// Invalid method
 	testRequestHeaderReadError(t, h, "G(ET /foo/bar HTTP/1.1\r\n: zero-key\r\n\r\n")
+
+	// Space before header name
+	testRequestHeaderReadError(t, h, "G(ET /foo/bar HTTP/1.1\r\n foo: bar\r\n\r\n")
 }
 
 func TestRequestHeaderReadSecuredError(t *testing.T) {
 	t.Parallel()
 
-	h := &RequestHeader{
-		secureErrorLogMessage: true,
-	}
+	h := &RequestHeader{}
+	h.secureErrorLogMessage = true
 
 	// incorrect first line
 	testRequestHeaderReadSecuredError(t, h, "fo")
@@ -2935,6 +3166,8 @@ func testRequestHeaderReadSuccess(t *testing.T, h *RequestHeader, headers string
 }
 
 func verifyResponseHeader(t *testing.T, h *ResponseHeader, expectedStatusCode, expectedContentLength int, expectedContentType, expectedContentEncoding string) {
+	t.Helper()
+
 	if h.StatusCode() != expectedStatusCode {
 		t.Fatalf("Unexpected status code %d. Expected %d", h.StatusCode(), expectedStatusCode)
 	}
@@ -2975,49 +3208,17 @@ func verifyRequestHeader(t *testing.T, h *RequestHeader, expectedContentLength i
 	}
 }
 
-func verifyResponseTrailer(t *testing.T, h *ResponseHeader, expectedTrailers map[string]string) {
-	t.Helper()
+type peeker interface {
+	Peek(key string) []byte
+}
 
+func verifyTrailer(t *testing.T, h peeker, expectedTrailers map[string]string) {
 	for k, v := range expectedTrailers {
 		got := h.Peek(k)
 		if !bytes.Equal(got, []byte(v)) {
 			t.Fatalf("Unexpected trailer %q. Expected %q. Got %q", k, v, got)
 		}
 	}
-}
-
-func verifyRequestTrailer(t *testing.T, h *RequestHeader, expectedTrailers map[string]string) {
-	for k, v := range expectedTrailers {
-		got := h.Peek(k)
-		if !bytes.Equal(got, []byte(v)) {
-			t.Fatalf("Unexpected trailer %q. Expected %q. Got %q", k, v, got)
-		}
-	}
-}
-
-func verifyTrailer(t *testing.T, r *bufio.Reader, expectedTrailers map[string]string, isReq bool) {
-	if isReq {
-		req := Request{}
-		err := req.Header.ReadTrailer(r)
-		if err == io.EOF && expectedTrailers == nil {
-			return
-		}
-		if err != nil {
-			t.Fatalf("Cannot read trailer: %v", err)
-		}
-		verifyRequestTrailer(t, &req.Header, expectedTrailers)
-		return
-	}
-
-	resp := Response{}
-	err := resp.Header.ReadTrailer(r)
-	if err == io.EOF && expectedTrailers == nil {
-		return
-	}
-	if err != nil {
-		t.Fatalf("Cannot read trailer: %v", err)
-	}
-	verifyResponseTrailer(t, &resp.Header, expectedTrailers)
 }
 
 func TestRequestHeader_PeekAll(t *testing.T) {
@@ -3104,13 +3305,13 @@ func TestRequestHeader_Keys(t *testing.T) {
 		t.Fatal(err)
 	}
 	actualKeys := h.PeekKeys()
-	expectedKeys := [][]byte{s2b("keep-alive"), s2b("aaa")}
-	if reflect.DeepEqual(actualKeys, expectedKeys) {
+	expectedKeys := [][]byte{[]byte("Content-Type"), []byte("Trailer"), []byte("Connection")}
+	if !reflect.DeepEqual(actualKeys, expectedKeys) {
 		t.Fatalf("Unexpected value %q. Expected %q", actualKeys, expectedKeys)
 	}
 	actualTrailerKeys := h.PeekTrailerKeys()
-	expectedTrailerKeys := [][]byte{s2b("aaa"), s2b("bbb"), s2b("ccc")}
-	if reflect.DeepEqual(actualTrailerKeys, expectedTrailerKeys) {
+	expectedTrailerKeys := [][]byte{s2b("Aaa"), s2b("Bbb"), s2b("Ccc")}
+	if !reflect.DeepEqual(actualTrailerKeys, expectedTrailerKeys) {
 		t.Fatalf("Unexpected value %q. Expected %q", actualTrailerKeys, expectedTrailerKeys)
 	}
 }
@@ -3124,13 +3325,13 @@ func TestResponseHeader_Keys(t *testing.T) {
 		t.Fatal(err)
 	}
 	actualKeys := h.PeekKeys()
-	expectedKeys := [][]byte{s2b("keep-alive"), s2b("aaa")}
-	if reflect.DeepEqual(actualKeys, expectedKeys) {
+	expectedKeys := [][]byte{[]byte("Content-Type"), []byte("Trailer"), []byte("Connection")}
+	if !reflect.DeepEqual(actualKeys, expectedKeys) {
 		t.Fatalf("Unexpected value %q. Expected %q", actualKeys, expectedKeys)
 	}
 	actualTrailerKeys := h.PeekTrailerKeys()
-	expectedTrailerKeys := [][]byte{s2b("aaa"), s2b("bbb"), s2b("ccc")}
-	if reflect.DeepEqual(actualTrailerKeys, expectedTrailerKeys) {
+	expectedTrailerKeys := [][]byte{s2b("Aaa"), s2b("Bbb"), s2b("Ccc")}
+	if !reflect.DeepEqual(actualTrailerKeys, expectedTrailerKeys) {
 		t.Fatalf("Unexpected value %q. Expected %q", actualTrailerKeys, expectedTrailerKeys)
 	}
 }
@@ -3200,5 +3401,74 @@ func TestAddVaryHeaderExistingAcceptEncoding(t *testing.T) {
 
 	if n := strings.Count(buf.String(), "Vary: "); n != 1 {
 		t.Errorf("Vary occurred %d times", n)
+	}
+}
+
+func TestRequestHeaderExtraWhitespace(t *testing.T) {
+	var h RequestHeader
+
+	// Test cases that should fail due to extra whitespace
+	testCases := []string{
+		"GET  /foo HTTP/1.1\r\nHost: example.com\r\n\r\n",    // Extra space after method
+		"GET   /foo HTTP/1.1\r\nHost: example.com\r\n\r\n",   // Multiple spaces after method
+		"GET /foo  HTTP/1.1\r\nHost: example.com\r\n\r\n",    // Extra space before HTTP version
+		"GET /foo   HTTP/1.1\r\nHost: example.com\r\n\r\n",   // Multiple spaces before HTTP version
+		"GET  /foo  HTTP/1.1\r\nHost: example.com\r\n\r\n",   // Extra spaces in both places
+		"GET   /foo   HTTP/1.1\r\nHost: example.com\r\n\r\n", // Multiple extra spaces in both places
+	}
+
+	for i, testCase := range testCases {
+		br := bufio.NewReader(bytes.NewBufferString(testCase))
+		err := h.Read(br)
+		if err == nil {
+			t.Errorf("Test case %d should have failed but didn't. Request: %q", i, testCase)
+		}
+		if !strings.Contains(err.Error(), "extra whitespace") {
+			t.Errorf("Test case %d should have failed with 'extra whitespace' error but got: %v", i, err)
+		}
+	}
+}
+
+func TestRequestHeaderValidWhitespace(t *testing.T) {
+	var h RequestHeader
+
+	// Test cases that should succeed (proper single space separation)
+	testCases := []struct {
+		request        string
+		expectedMethod string
+		expectedURI    string
+	}{
+		{
+			"GET /foo HTTP/1.1\r\nHost: example.com\r\n\r\n",
+			"GET",
+			"/foo",
+		},
+		{
+			"POST /api/v1/users HTTP/1.1\r\nHost: example.com\r\n\r\n",
+			"POST",
+			"/api/v1/users",
+		},
+		{
+			"PUT /resource HTTP/1.0\r\nHost: example.com\r\n\r\n",
+			"PUT",
+			"/resource",
+		},
+	}
+
+	for i, testCase := range testCases {
+		br := bufio.NewReader(bytes.NewBufferString(testCase.request))
+		err := h.Read(br)
+		if err != nil {
+			t.Errorf("Test case %d should have succeeded but failed with: %v. Request: %q", i, err, testCase.request)
+			continue
+		}
+
+		if string(h.Method()) != testCase.expectedMethod {
+			t.Errorf("Test case %d: expected method %q but got %q", i, testCase.expectedMethod, h.Method())
+		}
+
+		if string(h.RequestURI()) != testCase.expectedURI {
+			t.Errorf("Test case %d: expected URI %q but got %q", i, testCase.expectedURI, h.RequestURI())
+		}
 	}
 }

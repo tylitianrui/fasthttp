@@ -16,7 +16,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -543,7 +542,7 @@ func TestRequestCtxRedirectHTTPSSchemeless(t *testing.T) {
 
 	var ctx RequestCtx
 
-	s := "GET /foo/bar?baz HTTP/1.1\nHost: aaa.com\n\n"
+	s := "GET /foo/bar?baz HTTP/1.1\r\nHost: aaa.com\r\n\r\n"
 	br := bufio.NewReader(bytes.NewBufferString(s))
 	if err := ctx.Request.Read(br); err != nil {
 		t.Fatalf("cannot read request: %v", err)
@@ -1301,12 +1300,7 @@ func TestServerMultipartFormDataRequest(t *testing.T) {
 		{StreamRequestBody: true, DisablePreParseMultipartForm: false},
 		{StreamRequestBody: true, DisablePreParseMultipartForm: true},
 	} {
-		reqS := `POST /upload HTTP/1.1
-Host: qwerty.com
-Content-Length: 521
-Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryJwfATyF8tmxSJnLg
-
-------WebKitFormBoundaryJwfATyF8tmxSJnLg
+		b := strings.ReplaceAll(`------WebKitFormBoundaryJwfATyF8tmxSJnLg
 Content-Disposition: form-data; name="f1"
 
 value1
@@ -1321,12 +1315,21 @@ Content-Type: application/octet-stream
 - HTTP/2.0. See https://tools.ietf.org/html/rfc7540 .
 
 ------WebKitFormBoundaryJwfATyF8tmxSJnLg--
+`, "\n", "\r\n")
+
+		reqS := fmt.Sprintf(strings.ReplaceAll(`POST /upload HTTP/1.1
+Host: qwerty.com
+Content-Length: %d
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryJwfATyF8tmxSJnLg
+
+%s
 
 GET / HTTP/1.1
 Host: asbd
 Connection: close
 
-`
+`, "\n", "\r\n"), len(b), b)
+
 		ln := fasthttputil.NewInmemoryListener()
 
 		s := &Server{
@@ -1819,8 +1822,8 @@ func TestRequestCtxUserValue(t *testing.T) {
 			t.Fatalf("unexpected value obtained from VisitUserValues for key: %q, expecting: %#v but got: %#v", key, v, value)
 		}
 	})
-	if len(ctx.userValues) != vlen {
-		t.Fatalf("the length of user values returned from VisitUserValues is not equal to the length of the userValues, expecting: %d but got: %d", len(ctx.userValues), vlen)
+	if len(ctx.Request.userValues) != vlen {
+		t.Fatalf("the length of user values returned from VisitUserValues is not equal to the length of the userValues, expecting: %d but got: %d", len(ctx.Request.userValues), vlen)
 	}
 
 	ctx.ResetUserValues()
@@ -1916,6 +1919,49 @@ func TestServerExpect100Continue(t *testing.T) {
 	}
 	if len(data) > 0 {
 		t.Fatalf("unexpected remaining data %q", data)
+	}
+}
+
+func TestServerExpect103EarlyHints(t *testing.T) {
+	t.Parallel()
+
+	s := &Server{
+		NoDefaultContentType:  true,
+		NoDefaultDate:         true,
+		NoDefaultServerHeader: true,
+		Handler: func(ctx *RequestCtx) {
+			ctx.Response.Header.Add("Link", "<https://cdn.com>; rel=preload; as=script")
+			ctx.EarlyHints() //nolint:errcheck
+		},
+	}
+
+	rw := &readWriter{}
+	rw.r.WriteString("GET /foo HTTP/1.1\r\nContent-Length: 5\r\nContent-Type: a/b\r\n\r\n12345")
+
+	if err := s.ServeConn(rw); err != nil {
+		t.Fatalf("Unexpected error from serveConn: %v", err)
+	}
+
+	scanner := bufio.NewScanner(&rw.w)
+	expected := []string{
+		"HTTP/1.1 103 Early Hints",
+		"Link: <https://cdn.com>; rel=preload; as=script",
+		"",
+		"HTTP/1.1 200 OK",
+		"Content-Length: 0",
+		"Link: <https://cdn.com>; rel=preload; as=script",
+	}
+
+	i := 0
+	for scanner.Scan() {
+		if i >= len(expected) {
+			break
+		}
+		line := scanner.Text()
+		if line != expected[i] {
+			t.Fatalf("unexpected data: %s. Expecting %s", line, expected[i])
+		}
+		i++
 	}
 }
 
@@ -3887,7 +3933,7 @@ func TestShutdownWithContext(t *testing.T) {
 			t.Fatalf("unexpected err %v. Expecting %v", err, context.DeadlineExceeded)
 		}
 	}
-	if o := atomic.LoadInt32(&s.open); o != 1 {
+	if o := s.open.Load(); o != 1 {
 		t.Fatalf("unexpected open connection num: %#v. Expecting %#v", o, 1)
 	}
 }
@@ -4304,13 +4350,15 @@ func TestServerChunkedResponse(t *testing.T) {
 	}
 	for k, v := range trailer {
 		h := resp.Header.Peek(k)
-		if !bytes.Equal(resp.Header.Peek(k), []byte(v)) {
+		if !bytes.Equal(h, []byte(v)) {
 			t.Fatalf("Unexpected trailer %q. Expected %q. Got %q", k, v, h)
 		}
 	}
 }
 
 func verifyResponse(t *testing.T, r *bufio.Reader, expectedStatusCode int, expectedContentType, expectedBody string) *Response {
+	t.Helper()
+
 	var resp Response
 	if err := resp.Read(r); err != nil {
 		t.Fatalf("Unexpected error when parsing response: %v", err)
@@ -4368,7 +4416,9 @@ type testLogger struct {
 
 func (cl *testLogger) Printf(format string, args ...any) {
 	cl.lock.Lock()
-	cl.out += fmt.Sprintf(format, args...)[6:] + "\n"
+	line := fmt.Sprintf(format, args...)
+	space := strings.IndexByte(line, ' ') + 1
+	cl.out += line[space:] + "\n"
 	cl.lock.Unlock()
 }
 
