@@ -3,6 +3,7 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -216,7 +217,7 @@ func TestPipelineClientIssue832(t *testing.T) {
 
 	attempts := 10
 	go func() {
-		for i := 0; i < attempts; i++ {
+		for range attempts {
 			c, err := ln.Accept()
 			if err != nil {
 				t.Error(err)
@@ -234,7 +235,7 @@ func TestPipelineClientIssue832(t *testing.T) {
 	go func() {
 		defer close(done)
 
-		for i := 0; i < attempts; i++ {
+		for range attempts {
 			if err := client.Do(req, res); err == nil {
 				t.Error("error expected")
 			}
@@ -1044,14 +1045,14 @@ func testPipelineClientDoConcurrent(t *testing.T, concurrency int, maxBatchDelay
 	}
 
 	clientStopCh := make(chan struct{}, concurrency)
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		go func() {
 			testPipelineClientDo(t, c)
 			clientStopCh <- struct{}{}
 		}()
 	}
 
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		select {
 		case <-clientStopCh:
 		case <-time.After(3 * time.Second):
@@ -1078,7 +1079,7 @@ func testPipelineClientDo(t *testing.T, c *PipelineClient) {
 	req := AcquireRequest()
 	req.SetRequestURI("http://foobar/baz")
 	resp := AcquireResponse()
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if i&1 == 0 {
 			err = c.DoTimeout(req, resp, time.Second)
 		} else {
@@ -1148,7 +1149,7 @@ func testPipelineClientDisableHeaderNamesNormalizing(t *testing.T, timeout time.
 	var req Request
 	req.SetRequestURI("http://aaaai.com/bsdf?sddfsd")
 	var resp Response
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if timeout > 0 {
 			if err := c.DoTimeout(&req, &resp, timeout); err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -1208,7 +1209,7 @@ func TestClientDoTimeoutDisableHeaderNamesNormalizing(t *testing.T) {
 	var req Request
 	req.SetRequestURI("http://aaaai.com/bsdf?sddfsd")
 	var resp Response
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if err := c.DoTimeout(&req, &resp, time.Second); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1265,7 +1266,7 @@ func TestClientDoTimeoutDisablePathNormalizing(t *testing.T) {
 	var req Request
 	req.SetRequestURI(urlWithEncodedPath)
 	var resp Response
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if err := c.DoTimeout(&req, &resp, time.Second); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1319,7 +1320,7 @@ func TestHostClientPendingRequests(t *testing.T) {
 	}
 
 	resultCh := make(chan error, concurrency)
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		go func() {
 			req := AcquireRequest()
 			req.SetRequestURI("http://foobar/baz")
@@ -1339,7 +1340,7 @@ func TestHostClientPendingRequests(t *testing.T) {
 	}
 
 	// wait while all the requests reach server
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		select {
 		case <-readyCh:
 		case <-time.After(time.Second):
@@ -1354,7 +1355,7 @@ func TestHostClientPendingRequests(t *testing.T) {
 
 	// unblock request handlers on the server and wait until all the requests are finished.
 	close(doneCh)
-	for i := 0; i < concurrency; i++ {
+	for range concurrency {
 		select {
 		case err := <-resultCh:
 			if err != nil {
@@ -1416,11 +1417,10 @@ func TestHostClientMaxConnsWithDeadline(t *testing.T) {
 		MaxConns: 1,
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
 			req := AcquireRequest()
 			req.SetRequestURI("http://foobar/baz")
 			req.Header.SetMethod(MethodPost)
@@ -1495,7 +1495,7 @@ func TestHostClientMaxConnDuration(t *testing.T) {
 		MaxConnDuration: 10 * time.Millisecond,
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		statusCode, body, err := c.Get(nil, "http://aaaa.com/bbb/cc")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1551,7 +1551,7 @@ func TestHostClientMultipleAddrs(t *testing.T) {
 		},
 	}
 
-	for i := 0; i < 9; i++ {
+	for range 9 {
 		statusCode, body, err := c.Get(nil, "http://foobar/baz/aaa?bbb=ddd")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1623,7 +1623,7 @@ func TestClientFollowRedirects(t *testing.T) {
 		},
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		statusCode, body, err := c.GetTimeout(nil, "http://xxx/foo", time.Second)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1636,7 +1636,7 @@ func TestClientFollowRedirects(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		statusCode, body, err := c.Get(nil, "http://xxx/aaab/sss")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1649,7 +1649,7 @@ func TestClientFollowRedirects(t *testing.T) {
 		}
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		req := AcquireRequest()
 		resp := AcquireResponse()
 
@@ -1672,7 +1672,7 @@ func TestClientFollowRedirects(t *testing.T) {
 		ReleaseResponse(resp)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		req := AcquireRequest()
 		resp := AcquireResponse()
 
@@ -1696,7 +1696,7 @@ func TestClientFollowRedirects(t *testing.T) {
 		ReleaseResponse(resp)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		req := AcquireRequest()
 		resp := AcquireResponse()
 
@@ -1722,7 +1722,7 @@ func TestClientFollowRedirects(t *testing.T) {
 		ReleaseResponse(resp)
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		req := AcquireRequest()
 		resp := AcquireResponse()
 
@@ -1777,7 +1777,7 @@ func TestClientGetTimeoutSuccessConcurrent(t *testing.T) {
 	defer s.Stop()
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1804,7 +1804,7 @@ func TestClientDoTimeoutSuccessConcurrent(t *testing.T) {
 	defer s.Stop()
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1846,7 +1846,7 @@ func TestClientGetTimeoutErrorConcurrent(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1888,7 +1888,7 @@ func TestClientDoTimeoutErrorConcurrent(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1902,7 +1902,7 @@ func testClientDoTimeoutError(t *testing.T, c *Client, n int) {
 	var req Request
 	var resp Response
 	req.SetRequestURI("http://foobar.com/baz")
-	for i := 0; i < n; i++ {
+	for range n {
 		err := c.DoTimeout(&req, &resp, time.Millisecond)
 		if err == nil {
 			t.Errorf("expecting error")
@@ -1915,7 +1915,7 @@ func testClientDoTimeoutError(t *testing.T, c *Client, n int) {
 
 func testClientGetTimeoutError(t *testing.T, c *Client, n int) {
 	buf := make([]byte, 10)
-	for i := 0; i < n; i++ {
+	for range n {
 		statusCode, _, err := c.GetTimeout(buf, "http://foobar.com/baz", time.Millisecond)
 		if err == nil {
 			t.Errorf("expecting error")
@@ -1933,7 +1933,7 @@ func testClientRequestSetTimeoutError(t *testing.T, c *Client, n int) {
 	var req Request
 	var resp Response
 	req.SetRequestURI("http://foobar.com/baz")
-	for i := 0; i < n; i++ {
+	for range n {
 		req.SetTimeout(time.Millisecond)
 		err := c.Do(&req, &resp)
 		if err == nil {
@@ -1947,6 +1947,7 @@ func testClientRequestSetTimeoutError(t *testing.T, c *Client, n int) {
 
 type readTimeoutConn struct {
 	net.Conn
+
 	wc chan struct{}
 	rc chan struct{}
 	t  time.Duration
@@ -2180,7 +2181,7 @@ func TestHostClientTransport(t *testing.T) {
 		}(),
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		statusCode, body, err := c.Get(nil, "http://aaaa.com/bbb/cc")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -2266,6 +2267,7 @@ func (r *readErrorConn) SetWriteDeadline(_ time.Time) error {
 
 type singleReadConn struct {
 	net.Conn
+
 	s string
 	n int
 }
@@ -2305,6 +2307,7 @@ func (r *singleReadConn) SetWriteDeadline(_ time.Time) error {
 
 type singleEchoConn struct {
 	net.Conn
+
 	b []byte
 	n int
 }
@@ -2384,7 +2387,7 @@ func TestClientHTTPSInvalidServerName(t *testing.T) {
 
 	var c Client
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_, _, err := c.GetTimeout(nil, "https://"+sHTTPS.Addr(), time.Second)
 		if err == nil {
 			t.Fatalf("expecting TLS error")
@@ -2408,7 +2411,7 @@ func TestClientHTTPSConcurrent(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		wg.Add(1)
 		addr := "http://" + sHTTP.Addr()
 		if i&1 != 0 {
@@ -2426,15 +2429,15 @@ func TestClientHTTPSConcurrent(t *testing.T) {
 func TestClientManyServers(t *testing.T) {
 	t.Parallel()
 
-	var addrs []string
-	for i := 0; i < 10; i++ {
+	addrs := make([]string, 0, 10)
+	for range 10 {
 		s := startEchoServer(t, "tcp", "127.0.0.1:")
 		defer s.Stop()
 		addrs = append(addrs, s.Addr())
 	}
 
 	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		wg.Add(1)
 		addr := "http://" + addrs[i]
 		go func() {
@@ -2472,7 +2475,7 @@ func TestClientConcurrent(t *testing.T) {
 
 	addr := "http://" + s.Addr()
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -2527,7 +2530,7 @@ func TestHostClientConcurrent(t *testing.T) {
 	c := createEchoClient("unix", addr)
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -2540,7 +2543,7 @@ func TestHostClientConcurrent(t *testing.T) {
 
 func testClientGet(t *testing.T, c clientGetter, addr string, n int) {
 	var buf []byte
-	for i := 0; i < n; i++ {
+	for i := range n {
 		uri := fmt.Sprintf("%s/foo/%d?bar=baz", addr, i)
 		statusCode, body, err := c.Get(buf, uri)
 		buf = body
@@ -2561,7 +2564,7 @@ func testClientDoTimeoutSuccess(t *testing.T, c *Client, addr string, n int) {
 	var req Request
 	var resp Response
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		uri := fmt.Sprintf("%s/foo/%d?bar=baz", addr, i)
 		req.SetRequestURI(uri)
 		if err := c.DoTimeout(&req, &resp, time.Second); err != nil {
@@ -2584,7 +2587,7 @@ func testClientRequestSetTimeoutSuccess(t *testing.T, c *Client, addr string, n 
 	var req Request
 	var resp Response
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		uri := fmt.Sprintf("%s/foo/%d?bar=baz", addr, i)
 		req.SetRequestURI(uri)
 		req.SetTimeout(time.Second)
@@ -2606,7 +2609,7 @@ func testClientRequestSetTimeoutSuccess(t *testing.T, c *Client, addr string, n 
 
 func testClientGetTimeoutSuccess(t *testing.T, c *Client, addr string, n int) {
 	var buf []byte
-	for i := 0; i < n; i++ {
+	for i := range n {
 		uri := fmt.Sprintf("%s/foo/%d?bar=baz", addr, i)
 		statusCode, body, err := c.GetTimeout(buf, uri, time.Second)
 		buf = body
@@ -2629,7 +2632,7 @@ func testClientGetTimeoutSuccess(t *testing.T, c *Client, addr string, n int) {
 func testClientPost(t *testing.T, c clientPoster, addr string, n int) {
 	var buf []byte
 	var args Args
-	for i := 0; i < n; i++ {
+	for i := range n {
 		uri := fmt.Sprintf("%s/foo/%d?bar=baz", addr, i)
 		args.Set("xx", fmt.Sprintf("yy%d", i))
 		args.Set("zzz", fmt.Sprintf("qwe_%d", i))
@@ -2859,11 +2862,10 @@ func TestHostClientMaxConnWaitTimeoutSuccess(t *testing.T) {
 		MaxConnWaitTimeout: time.Second * 2,
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
 			req := AcquireRequest()
 			req.SetRequestURI("http://foobar/baz")
 			req.Header.SetMethod(MethodPost)
@@ -2937,11 +2939,10 @@ func TestHostClientMaxConnWaitTimeoutError(t *testing.T) {
 	}
 
 	var errNoFreeConnsCount atomic.Uint32
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
 			req := AcquireRequest()
 			req.SetRequestURI("http://foobar/baz")
 			req.Header.SetMethod(MethodPost)
@@ -3034,11 +3035,10 @@ func TestHostClientMaxConnWaitTimeoutWithEarlierDeadline(t *testing.T) {
 	}
 
 	var errTimeoutCount atomic.Uint32
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
 			req := AcquireRequest()
 			req.SetRequestURI("http://foobar/baz")
 			req.Header.SetMethod(MethodPost)
@@ -3277,7 +3277,7 @@ func TestClientTransportEx(t *testing.T) {
 	const loopCount = 4
 	const getCount = 20
 	const postCount = 10
-	for i := 0; i < loopCount; i++ {
+	for i := range loopCount {
 		addr := "http://" + sHTTP.Addr()
 		if i&1 != 0 {
 			addr = "https://" + sHTTPS.Addr()
@@ -3555,4 +3555,139 @@ func (f F) Read(p []byte) (n int, err error) {
 	// segments to a closed connection.
 	time.Sleep(500 * time.Microsecond)
 	return f.Reader.Read(p)
+}
+
+func TestTCPDialerFlushDNSCache(t *testing.T) {
+	resolver := &testResolver{
+		lookupCountByHost: make(map[string]int),
+		resolver:          net.DefaultResolver,
+	}
+
+	dialer := &TCPDialer{
+		DNSCacheDuration: 30 * time.Minute, // Long cache
+		Resolver:         resolver,
+	}
+
+	// First dial - should trigger DNS lookup
+	conn1, err := dialer.DialTimeout("httpbin.org:80", 5*time.Second)
+	if err != nil {
+		t.Skip("Dial failed:", err)
+	}
+	conn1.Close()
+
+	if resolver.lookupCountByHost["httpbin.org"] != 1 {
+		t.Errorf("Expected 1 DNS lookup after first dial, got %d", resolver.lookupCountByHost["httpbin.org"])
+	}
+
+	// Second dial - should use cache (no new DNS lookup)
+	conn2, err := dialer.DialTimeout("httpbin.org:80", 5*time.Second)
+	if err != nil {
+		t.Skip("Second dial failed:", err)
+	}
+	conn2.Close()
+
+	if resolver.lookupCountByHost["httpbin.org"] != 1 {
+		t.Errorf("Expected 1 DNS lookup after cached dial, got %d", resolver.lookupCountByHost["httpbin.org"])
+	}
+
+	// Flush cache - should clear all entries
+	dialer.FlushDNSCache()
+
+	// Third dial - should trigger new DNS lookup since cache was flushed
+	conn3, err := dialer.DialTimeout("httpbin.org:80", 5*time.Second)
+	if err != nil {
+		t.Skip("Third dial failed:", err)
+	}
+	conn3.Close()
+
+	if resolver.lookupCountByHost["httpbin.org"] != 2 {
+		t.Errorf("Expected 2 DNS lookups after cache flush, got %d", resolver.lookupCountByHost["httpbin.org"])
+	}
+}
+
+// Simple test resolver that implements the Resolver interface.
+type testResolver struct {
+	resolver          *net.Resolver
+	lookupCountByHost map[string]int
+}
+
+func (r *testResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	r.lookupCountByHost[host]++
+	return r.resolver.LookupIPAddr(ctx, host)
+}
+
+type TransportMock struct {
+	wrapperFunc func(hc *HostClient, req *Request, resp *Response) (retry bool, err error)
+}
+
+func (t *TransportMock) RoundTrip(hc *HostClient, req *Request, resp *Response) (retry bool, err error) {
+	return t.wrapperFunc(hc, req, resp)
+}
+
+func TestClient_RetryIfErrUpstream(t *testing.T) {
+	t.Parallel()
+	upstreamErr := errors.New("upstream error")
+
+	t.Run("upstream_known", func(t *testing.T) {
+		retryIfErrCalled := false
+		c := &Client{
+			Transport: &TransportMock{
+				wrapperFunc: func(hc *HostClient, req *Request, resp *Response) (retry bool, err error) {
+					resp.raddr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}
+					return true, upstreamErr
+				},
+			},
+			RetryIfErrUpstream: func(request *Request, attempts int, err error, upstream string) (resetTimeout bool, retry bool) {
+				retryIfErrCalled = true
+				if upstream != "127.0.0.1:8080" {
+					t.Errorf("expected upstream to be 127.0.0.1:8080, got %s", upstream)
+				}
+
+				return false, false
+			},
+		}
+		req := AcquireRequest()
+		res := AcquireResponse()
+
+		req.SetRequestURI("http://example.com")
+
+		err := c.Do(req, res)
+		if !errors.Is(err, upstreamErr) {
+			t.Fatal(err)
+		}
+		if !retryIfErrCalled {
+			t.Fatal("RetryIfErrUpstream should be called")
+		}
+	})
+
+	t.Run("no_upstream", func(t *testing.T) {
+		retryIfErrCalled := false
+		c := &Client{
+			Transport: &TransportMock{
+				wrapperFunc: func(hc *HostClient, req *Request, resp *Response) (retry bool, err error) {
+					return true, upstreamErr
+				},
+			},
+			RetryIfErrUpstream: func(request *Request, attempts int, err error, upstream string) (resetTimeout bool, retry bool) {
+				retryIfErrCalled = true
+				if upstream != "" {
+					t.Errorf("expected upstream to be empty, got %s", upstream)
+				}
+
+				return false, false
+			},
+		}
+		req := AcquireRequest()
+		res := AcquireResponse()
+
+		req.SetRequestURI("http://example.com")
+
+		err := c.Do(req, res)
+		if !errors.Is(err, upstreamErr) {
+			t.Fatal(err)
+		}
+		if !retryIfErrCalled {
+			t.Fatal("RetryIfErrUpstream should be called")
+		}
+	})
 }

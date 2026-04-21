@@ -27,7 +27,7 @@ func (s *headerScanner) next() bool {
 
 		i := bytes.Index(s.b, strCRLFCRLF)
 		if i < 0 {
-			s.err = errNeedMore
+			s.err = ErrNeedMore
 			return false
 		}
 		i += 4
@@ -88,7 +88,7 @@ func (s *headerScanner) readLine() (line []byte) {
 	}
 
 	if len(line) == 0 {
-		return
+		return nil
 	}
 
 	// drop \n and possible preceding \r
@@ -99,7 +99,7 @@ func (s *headerScanner) readLine() (line []byte) {
 		}
 		line = line[:len(line)-drop]
 	}
-	return
+	return line
 }
 
 // readContinuedLineSlice reads continued lines from b until it finds a line
@@ -165,4 +165,15 @@ func trim(s []byte) []byte {
 		n--
 	}
 	return s[i:n]
+}
+
+func trimTrailingSpace(s []byte) []byte {
+	for len(s) > 0 {
+		c := s[len(s)-1]
+		if c != ' ' && c != '\t' {
+			break
+		}
+		s = s[:len(s)-1]
+	}
+	return s
 }

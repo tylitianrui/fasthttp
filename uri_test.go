@@ -35,14 +35,14 @@ func TestURIAcquireReleaseConcurrent(t *testing.T) {
 	t.Parallel()
 
 	ch := make(chan struct{}, 10)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		go func() {
 			testURIAcquireRelease(t)
 			ch <- struct{}{}
 		}()
 	}
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		select {
 		case <-ch:
 		case <-time.After(time.Second):
@@ -52,7 +52,7 @@ func TestURIAcquireReleaseConcurrent(t *testing.T) {
 }
 
 func testURIAcquireRelease(t *testing.T) {
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		u := AcquireURI()
 		host := fmt.Sprintf("host.%d.com", i*23)
 		path := fmt.Sprintf("/foo/%d/bar", i*17)
@@ -104,6 +104,68 @@ func testURIPathEscape(t *testing.T, path, expectedRequestURI string) {
 	}
 }
 
+func TestURIRejectInvalidIPv6(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		"http://[0:0::vulndetector.com]:80",
+		"http://[2001:db8::vulndetector.com]/",
+		"http://[vulndetector.com]/",
+		"http://[::ffff:192.0.2.300]/",
+	} {
+		var u URI
+		if err := u.Parse(nil, []byte(raw)); err == nil {
+			t.Errorf("expected Parse to fail for %q", raw)
+		}
+	}
+
+	for _, raw := range []string{
+		"http://[2001:db8::1]/",
+		"http://[fe80::1%25en0]/",
+		"http://[::ffff:192.0.2.1]/",
+	} {
+		var u URI
+		if err := u.Parse(nil, []byte(raw)); err != nil {
+			t.Errorf("unexpected error for %q: %v", raw, err)
+		}
+	}
+}
+
+func TestURIRejectInvalidScheme(t *testing.T) {
+	t.Parallel()
+
+	var u URI
+	if err := u.Parse(nil, []byte("https>://vulndetector.com/path")); err == nil {
+		t.Fatalf("expected invalid scheme error, got nil")
+	}
+
+	var relative URI
+	if err := relative.Parse(nil, []byte("/relative")); err != nil {
+		t.Fatalf("unexpected error for relative path: %v", err)
+	}
+}
+
+func TestURIRejectMultiplePorts(t *testing.T) {
+	t.Parallel()
+
+	testcases := []string{
+		"http://192.168.1.1:1111:2222/",
+		"http://example.com:80:8080/",
+	}
+
+	for _, raw := range testcases {
+		var u URI
+		if err := u.Parse(nil, []byte(raw)); err == nil {
+			t.Fatalf("expected Parse to fail for %q", raw)
+		}
+	}
+
+	var valid URI
+	if err := valid.Parse(nil, []byte("http://192.168.1.1:1111/")); err != nil {
+		t.Fatalf("unexpected error for valid uri: %v", err)
+	}
+}
+
 func TestURIUpdate(t *testing.T) {
 	t.Parallel()
 
@@ -141,6 +203,22 @@ func TestURIUpdate(t *testing.T) {
 	testURIUpdate(t, "http://example.net/", "//example.com:8080/", "http://example.com:8080/")
 }
 
+func TestURIRejectsMixedBracketHost(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{
+		"http://127.0.0.1[192.168.0.1]/",
+		"http://example.com[fd00::1]/",
+	}
+
+	for _, raw := range tests {
+		var u URI
+		if err := u.Parse(nil, []byte(raw)); err == nil {
+			t.Fatalf("expected error for %q", raw)
+		}
+	}
+}
+
 func testURIUpdate(t *testing.T, base, update, result string) {
 	var u URI
 	u.Parse(nil, []byte(base)) //nolint:errcheck
@@ -148,6 +226,44 @@ func testURIUpdate(t *testing.T, base, update, result string) {
 	s := u.String()
 	if s != result {
 		t.Fatalf("unexpected result %q. Expecting %q. base=%q, update=%q", s, result, base, update)
+	}
+}
+
+func TestURIRejectInvalidUserinfo(t *testing.T) {
+	t.Parallel()
+
+	bad := []string{
+		"http://[normal.com@]vulndetector.com/",
+		"http://normal.com[user@vulndetector].com/",
+		"http://normal.com[@]vulndetector.com/",
+	}
+
+	for _, raw := range bad {
+		var u URI
+		if err := u.Parse(nil, []byte(raw)); err == nil {
+			t.Fatalf("expected error parsing %q", raw)
+		}
+	}
+}
+
+func TestURIAllowAtInUserinfo(t *testing.T) {
+	t.Parallel()
+
+	var u URI
+	if err := u.Parse(nil, []byte("http://user:p@ss@example.com/")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got := string(u.Host()); got != "example.com" {
+		t.Fatalf("unexpected host %q", got)
+	}
+
+	if got := string(u.Username()); got != "user" {
+		t.Fatalf("unexpected username %q", got)
+	}
+
+	if got := string(u.Password()); got != "p@ss" {
+		t.Fatalf("unexpected password %q", got)
 	}
 }
 

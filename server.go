@@ -20,6 +20,7 @@ import (
 var errNoCertOrKeyProvided = errors.New("cert or key has not provided")
 
 // ErrAlreadyServing is deprecated.
+//
 // Deprecated: ErrAlreadyServing is never returned from Serve. See issue #633.
 var ErrAlreadyServing = errors.New("Server is already serving connections")
 
@@ -209,10 +210,14 @@ type Server struct {
 	// instead.
 	TLSConfig *tls.Config
 
-	// FormValueFunc, which is used by RequestCtx.FormValue and support for customizing
-	// the behaviour of the RequestCtx.FormValue function.
+	// FormValueFunc customizes the behavior of RequestCtx.FormValue.
 	//
-	// NetHttpFormValueFunc gives a FormValueFunc func implementation that is consistent with net/http.
+	// For multipart requests, the default FormValue path calls MultipartForm()
+	// without a body size limit. If you need a limit for multipart parsing,
+	// provide a custom FormValueFunc and call MultipartFormWithLimit() there.
+	//
+	// NetHttpFormValueFunc gives a FormValueFunc implementation that is
+	// consistent with net/http.
 	FormValueFunc FormValueFunc
 
 	nextProtos map[string]ServeHandler
@@ -287,6 +292,7 @@ type Server struct {
 	MaxRequestsPerConn int
 
 	// MaxKeepaliveDuration is a no-op and only left here for backwards compatibility.
+	//
 	// Deprecated: Use IdleTimeout instead.
 	MaxKeepaliveDuration time.Duration
 
@@ -1075,6 +1081,9 @@ func (ctx *RequestCtx) PostArgs() *Args {
 // Returns ErrNoMultipartForm if request's content-type
 // isn't 'multipart/form-data'.
 //
+// This method is equivalent to MultipartFormWithLimit(0), i.e. no body size
+// limit is applied during multipart parsing.
+//
 // All uploaded temporary files are automatically deleted after
 // returning from RequestHandler. Either move or copy uploaded files
 // into new place if you want retaining them.
@@ -1088,6 +1097,17 @@ func (ctx *RequestCtx) MultipartForm() (*multipart.Form, error) {
 	return ctx.Request.MultipartForm()
 }
 
+// MultipartFormWithLimit returns request's multipart form and limits the read
+// multipart body size to maxBodySize bytes.
+//
+// If maxBodySize <= 0, then no limit is applied.
+//
+// Call this method before FormValue/FormFile if you need a limit for
+// multipart parsing.
+func (ctx *RequestCtx) MultipartFormWithLimit(maxBodySize int) (*multipart.Form, error) {
+	return ctx.Request.MultipartFormWithLimit(maxBodySize)
+}
+
 // FormFile returns uploaded file associated with the given multipart form key.
 //
 // The file is automatically deleted after returning from RequestHandler,
@@ -1096,6 +1116,9 @@ func (ctx *RequestCtx) MultipartForm() (*multipart.Form, error) {
 // Use SaveMultipartFile function for permanently saving uploaded file.
 //
 // The returned file header is valid until your request handler returns.
+//
+// For multipart requests with untrusted input, call MultipartFormWithLimit()
+// before FormFile.
 func (ctx *RequestCtx) FormFile(key string) (*multipart.FileHeader, error) {
 	mf, err := ctx.MultipartForm()
 	if err != nil {
@@ -1123,14 +1146,14 @@ func SaveMultipartFile(fh *multipart.FileHeader, path string) (err error) {
 	)
 	f, err = fh.Open()
 	if err != nil {
-		return
+		return err
 	}
 
 	var ok bool
 	if ff, ok = f.(*os.File); ok {
 		// Windows can't rename files that are opened.
 		if err = f.Close(); err != nil {
-			return
+			return err
 		}
 
 		// If renaming fails we try the normal copying method.
@@ -1141,7 +1164,7 @@ func SaveMultipartFile(fh *multipart.FileHeader, path string) (err error) {
 
 		// Reopen f for the code below.
 		if f, err = fh.Open(); err != nil {
-			return
+			return err
 		}
 	}
 
@@ -1153,7 +1176,7 @@ func SaveMultipartFile(fh *multipart.FileHeader, path string) (err error) {
 	}()
 
 	if ff, err = os.Create(path); err != nil {
-		return
+		return err
 	}
 	defer func() {
 		e := ff.Close()
@@ -1162,7 +1185,7 @@ func SaveMultipartFile(fh *multipart.FileHeader, path string) (err error) {
 		}
 	}()
 	_, err = copyZeroAlloc(ff, f)
-	return
+	return err
 }
 
 // FormValue returns form value associated with the given key.
@@ -1180,6 +1203,10 @@ func SaveMultipartFile(fh *multipart.FileHeader, path string) (err error) {
 //   - FormFile for obtaining uploaded files.
 //
 // The returned value is valid until your request handler returns.
+//
+// For multipart requests with untrusted input, either call
+// MultipartFormWithLimit() before FormValue or provide a custom
+// Server.FormValueFunc that uses MultipartFormWithLimit().
 func (ctx *RequestCtx) FormValue(key string) []byte {
 	if ctx.formValueFunc != nil {
 		return ctx.formValueFunc(ctx, key)
@@ -1187,6 +1214,7 @@ func (ctx *RequestCtx) FormValue(key string) []byte {
 	return defaultFormValue(ctx, key)
 }
 
+// FormValueFunc customizes how RequestCtx.FormValue resolves a value.
 type FormValueFunc func(*RequestCtx, string) []byte
 
 var (
@@ -1459,13 +1487,33 @@ func (ctx *RequestCtx) ResetBody() {
 //
 // SendFile logs all the errors via ctx.Logger.
 //
-// See also ServeFile, FSHandler and FS.
+// SendFile interprets path as a URI path internally. Percent-encoded
+// sequences may be decoded, and '?' or '#' may be treated as URI delimiters.
+// Use SendFileLiteral if you need literal path semantics.
+//
+// See also ServeFile, SendFileLiteral, FSHandler and FS.
 //
 // WARNING: do not pass any user supplied paths to this function!
 // WARNING: if path is based on user input users will be able to request
 // any file on your filesystem! Use fasthttp.FS with a sane Root instead.
 func (ctx *RequestCtx) SendFile(path string) {
 	ServeFile(ctx, path)
+}
+
+// SendFileLiteral sends local file contents from the given path as response body
+// using literal path semantics.
+//
+// This is a shortcut to ServeFileLiteral(ctx, path).
+//
+// SendFileLiteral logs all the errors via ctx.Logger.
+//
+// See also ServeFileLiteral, SendFile, FSHandler and FS.
+//
+// WARNING: do not pass any user supplied paths to this function!
+// WARNING: if path is based on user input users will be able to request
+// any file on your filesystem! Use fasthttp.FS with a sane Root instead.
+func (ctx *RequestCtx) SendFileLiteral(path string) {
+	ServeFileLiteral(ctx, path)
 }
 
 // SendFileBytes sends local file contents from the given path as response body.
@@ -1649,26 +1697,26 @@ func (s *Server) NextProto(key string, nph ServeHandler) {
 	s.nextProtos[key] = nph
 }
 
-func (s *Server) getNextProto(c net.Conn) (proto string, err error) {
+func (s *Server) getNextProto(c net.Conn) (string, error) {
 	if tlsConn, ok := c.(connTLSer); ok {
 		if s.ReadTimeout > 0 {
-			if err = c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
-				return
+			if err := c.SetReadDeadline(time.Now().Add(s.ReadTimeout)); err != nil {
+				return "", err
 			}
 		}
 
 		if s.WriteTimeout > 0 {
-			if err = c.SetWriteDeadline(time.Now().Add(s.WriteTimeout)); err != nil {
-				return
+			if err := c.SetWriteDeadline(time.Now().Add(s.WriteTimeout)); err != nil {
+				return "", err
 			}
 		}
 
-		err = tlsConn.Handshake()
+		err := tlsConn.Handshake()
 		if err == nil {
-			proto = tlsConn.ConnectionState().NegotiatedProtocol
+			return tlsConn.ConnectionState().NegotiatedProtocol, nil
 		}
 	}
-	return
+	return "", nil
 }
 
 // ListenAndServe serves HTTP requests from the given TCP4 addr.
@@ -2173,20 +2221,20 @@ func (s *Server) serveConnCleanup() {
 	s.concurrency.Add(^uint32(0))
 }
 
-func (s *Server) serveConn(c net.Conn) (err error) {
+func (s *Server) serveConn(c net.Conn) error {
 	defer s.serveConnCleanup()
 	s.concurrency.Add(1)
 
-	var proto string
-	if proto, err = s.getNextProto(c); err != nil {
-		return
+	proto, err := s.getNextProto(c)
+	if err != nil {
+		return err
 	}
 	if handler, ok := s.nextProtos[proto]; ok {
 		// Remove read or write deadlines that might have previously been set.
 		// The next handler is responsible for setting its own deadlines.
 		if s.ReadTimeout > 0 || s.WriteTimeout > 0 {
-			if err = c.SetDeadline(zeroTime); err != nil {
-				return
+			if err := c.SetDeadline(zeroTime); err != nil {
+				return err
 			}
 		}
 
@@ -2314,7 +2362,7 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 			// outgoing buffer first so it doesn't have to wait.
 			if bw != nil && bw.Buffered() > 0 {
 				err = ctx.Request.Header.readLoop(br, false)
-				if err == errNeedMore {
+				if err == ErrNeedMore {
 					err = bw.Flush()
 					if err != nil {
 						break
@@ -2349,11 +2397,21 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 						writeTimeout = s.WriteTimeout
 					}
 				}
-				// read body
-				if s.StreamRequestBody {
-					err = ctx.Request.readBodyStream(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
-				} else {
-					err = ctx.Request.readLimitBody(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
+
+				if err == nil {
+					if err = ctx.Request.parseURI(); err != nil {
+						bw = s.writeErrorResponse(bw, ctx, serverName, err)
+						break
+					}
+				}
+
+				if err == nil {
+					// read body
+					if s.StreamRequestBody {
+						err = ctx.Request.readBodyStream(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
+					} else {
+						err = ctx.Request.readLimitBody(br, maxRequestBodySize, s.GetOnly, !s.DisablePreParseMultipartForm)
+					}
 				}
 			}
 			// When StreamRequestBody is set to true, we cannot safely release br.
@@ -2589,7 +2647,7 @@ func (s *Server) serveConn(c net.Conn) (err error) {
 	}
 	s.idleConnsMu.Unlock()
 
-	return
+	return err
 }
 
 func (s *Server) setState(nc net.Conn, state ConnState) {
@@ -2636,6 +2694,7 @@ func (s *Server) releaseHijackConn(hjc *hijackConn) {
 
 type hijackConn struct {
 	net.Conn
+
 	r io.Reader
 	s *Server
 }
@@ -2707,7 +2766,7 @@ func acquireByteReader(ctxP **RequestCtx) (*bufio.Reader, error) {
 	}
 
 	ctx.fbr.c = c
-	ctx.fbr.ch = b[0]
+	ctx.fbr.ch = b[0] // #nosec G602
 	ctx.fbr.byteRead = false
 	r := acquireReader(ctx)
 	r.Reset(&ctx.fbr)
@@ -2817,7 +2876,7 @@ func (ctx *RequestCtx) Init(req *Request, remoteAddr net.Addr, logger Logger) {
 // This method always returns 0, false and is only present to make
 // RequestCtx implement the context interface.
 func (ctx *RequestCtx) Deadline() (deadline time.Time, ok bool) {
-	return
+	return time.Time{}, false
 }
 
 // Done returns a channel that's closed when work done on behalf of this
@@ -2866,6 +2925,7 @@ var fakeServer = &Server{
 
 type fakeAddrer struct {
 	net.Conn
+
 	laddr net.Addr
 	raddr net.Addr
 }

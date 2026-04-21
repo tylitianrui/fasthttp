@@ -17,10 +17,6 @@ import (
 )
 
 var (
-	// Used for caching authentication information when using an HTTP proxy,
-	// it helps avoid re-encoding the authentication details when the ProxyURL
-	// changes along with the request URL.
-	authCache    = sync.Map{}
 	colonTLSPort = ":443"
 	tmpURL       = &url.URL{Scheme: httpsScheme, Host: "example.com"}
 )
@@ -54,6 +50,7 @@ type Dialer struct {
 	// A best effort is made to parse the string and errors are
 	// ignored.
 	httpproxy.Config
+
 	// Attempt to connect to both ipv4 and ipv6 addresses if set to true.
 	// By default, dial only to ipv4 addresses,
 	// since unfortunately ipv6 remains broken in many networks worldwide :)
@@ -74,7 +71,7 @@ type Dialer struct {
 
 // GetDialFunc method returns a fasthttp-style dial function. The useEnv parameter
 // determines whether the proxy address comes from Dialer.Config or from environment variables.
-func (d *Dialer) GetDialFunc(useEnv bool) (dialFunc fasthttp.DialFunc, err error) {
+func (d *Dialer) GetDialFunc(useEnv bool) (fasthttp.DialFunc, error) {
 	config := &d.Config
 	if useEnv {
 		config = httpproxy.FromEnvironment()
@@ -88,7 +85,7 @@ func (d *Dialer) GetDialFunc(useEnv bool) (dialFunc fasthttp.DialFunc, err error
 	if proxyURLIsSame {
 		var proxyURL *url.URL
 		var proxyDialer proxy.Dialer
-		proxyURL, err = proxyFunc(tmpURL)
+		proxyURL, err := proxyFunc(tmpURL)
 		if err != nil {
 			return nil, err
 		}
@@ -102,10 +99,10 @@ func (d *Dialer) GetDialFunc(useEnv bool) (dialFunc fasthttp.DialFunc, err error
 		case "socks5", "socks5h":
 			proxyDialer, err = proxy.FromURL(proxyURL, d)
 			if err != nil {
-				return
+				return nil, err
 			}
 		case "http":
-			proxyAddr, auth := addrAndAuth(proxyURL)
+			proxyAddr, auth := addrAndAuth(proxyURL, nil)
 			proxyDialer = DialerFunc(func(network, addr string) (conn net.Conn, err error) {
 				return httpProxyDial(d, network, addr, proxyAddr, auth)
 			})
@@ -117,6 +114,7 @@ func (d *Dialer) GetDialFunc(useEnv bool) (dialFunc fasthttp.DialFunc, err error
 		}, nil
 	}
 	// slow path when the proxyURL changes along with the request URL.
+	var authCache sync.Map
 	return func(addr string) (conn net.Conn, err error) {
 		var proxyDialer proxy.Dialer
 		var proxyURL *url.URL
@@ -127,7 +125,7 @@ func (d *Dialer) GetDialFunc(useEnv bool) (dialFunc fasthttp.DialFunc, err error
 		reqURL := &url.URL{Host: addr, Scheme: scheme}
 		proxyURL, err = proxyFunc(reqURL)
 		if err != nil {
-			return
+			return nil, err
 		}
 		if proxyURL == nil {
 			// dial directly
@@ -137,10 +135,10 @@ func (d *Dialer) GetDialFunc(useEnv bool) (dialFunc fasthttp.DialFunc, err error
 		case "socks5", "socks5h":
 			proxyDialer, err = proxy.FromURL(proxyURL, d)
 			if err != nil {
-				return
+				return nil, err
 			}
 		case "http":
-			proxyAddr, auth := addrAndAuth(proxyURL)
+			proxyAddr, auth := addrAndAuth(proxyURL, &authCache)
 			proxyDialer = DialerFunc(func(network, addr string) (conn net.Conn, err error) {
 				return httpProxyDial(d, network, addr, proxyAddr, auth)
 			})
@@ -152,7 +150,7 @@ func (d *Dialer) GetDialFunc(useEnv bool) (dialFunc fasthttp.DialFunc, err error
 }
 
 // Dial is solely for implementing the proxy.Dialer interface.
-func (d *Dialer) Dial(network, addr string) (conn net.Conn, err error) {
+func (d *Dialer) Dial(network, addr string) (net.Conn, error) {
 	if network == "tcp4" {
 		if d.Timeout > 0 {
 			return d.DialTimeout(addr, d.Timeout)
@@ -165,8 +163,8 @@ func (d *Dialer) Dial(network, addr string) (conn net.Conn, err error) {
 		}
 		return d.TCPDialer.DialDualStack(addr)
 	}
-	err = errors.New("dont support the network: " + network)
-	return
+	err := errors.New("dont support the network: " + network)
+	return nil, err
 }
 
 func (d *Dialer) connectTimeout() time.Duration {
@@ -189,10 +187,14 @@ func (d DialerFunc) Dial(network, addr string) (net.Conn, error) {
 }
 
 // Establish a connection through an HTTP proxy.
-func httpProxyDial(dialer proxy.Dialer, network, addr, proxyAddr, auth string) (conn net.Conn, err error) {
-	conn, err = dialer.Dial(network, proxyAddr)
+func httpProxyDial(dialer proxy.Dialer, network, addr, proxyAddr, auth string) (net.Conn, error) {
+	if strings.ContainsAny(addr, "\r\n") {
+		return nil, fmt.Errorf("proxy dial target address contains CR or LF: %q", addr)
+	}
+
+	conn, err := dialer.Dial(network, proxyAddr)
 	if err != nil {
-		return
+		return nil, err
 	}
 	var connectTimeout time.Duration
 	hp, ok := dialer.(httpProxyDialer)
@@ -217,21 +219,21 @@ func httpProxyDial(dialer proxy.Dialer, network, addr, proxyAddr, auth string) (
 	_, err = conn.Write([]byte(req))
 	if err != nil {
 		_ = conn.Close()
-		return
+		return nil, err
 	}
 	res := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseResponse(res)
 	res.SkipBody = true
 	if err = res.Read(bufio.NewReaderSize(conn, 1024)); err != nil {
 		_ = conn.Close()
-		return
+		return nil, err
 	}
 	if res.Header.StatusCode() != 200 {
 		_ = conn.Close()
 		err = fmt.Errorf("could not connect to proxyAddr: %s status code: %d", proxyAddr, res.Header.StatusCode())
-		return
+		return nil, err
 	}
-	return
+	return conn, err
 }
 
 // Cache authentication information for HTTP proxies.
@@ -240,21 +242,23 @@ type proxyInfo struct {
 	addr string
 }
 
-func addrAndAuth(pu *url.URL) (proxyAddr, auth string) {
+func addrAndAuth(pu *url.URL, authCache *sync.Map) (proxyAddr, auth string) {
 	if pu.User == nil {
 		proxyAddr = pu.Host + pu.Path
-		return
+		return proxyAddr, auth
 	}
-	var info *proxyInfo
-	v, ok := authCache.Load(pu)
-	if ok {
-		info = v.(*proxyInfo)
-		return info.addr, info.auth
+	if authCache != nil {
+		if v, ok := authCache.Load(pu); ok {
+			info := v.(*proxyInfo)
+			return info.addr, info.auth
+		}
 	}
-	info = &proxyInfo{
+	info := &proxyInfo{
 		auth: base64.StdEncoding.EncodeToString([]byte(pu.User.String())),
 		addr: pu.Host + pu.Path,
 	}
-	authCache.Store(pu, info)
+	if authCache != nil {
+		authCache.Store(pu, info)
+	}
 	return info.addr, info.auth
 }

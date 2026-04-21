@@ -16,7 +16,7 @@ func TestInmemoryListener(t *testing.T) {
 	ln := NewInmemoryListener()
 
 	ch := make(chan struct{})
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		go func(n int) {
 			conn, err := ln.Dial()
 			if err != nil {
@@ -77,7 +77,7 @@ func TestInmemoryListener(t *testing.T) {
 		}
 	}()
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		select {
 		case <-ch:
 		case <-time.After(time.Second):
@@ -134,7 +134,7 @@ func testInmemoryListenerHTTP(t *testing.T, f func(t *testing.T, client *http.Cl
 
 	f(t, client)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*100)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond*100)
 	defer cancel()
 	server.Shutdown(ctx) //nolint:errcheck
 }
@@ -163,7 +163,7 @@ func TestInmemoryListenerHTTPSingle(t *testing.T) {
 
 func TestInmemoryListenerHTTPSerial(t *testing.T) {
 	testInmemoryListenerHTTP(t, func(t *testing.T, client *http.Client) {
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			testInmemoryListenerHTTPSingle(t, client, fmt.Sprintf("request_%d", i))
 		}
 	})
@@ -172,7 +172,7 @@ func TestInmemoryListenerHTTPSerial(t *testing.T) {
 func TestInmemoryListenerHTTPConcurrent(t *testing.T) {
 	testInmemoryListenerHTTP(t, func(t *testing.T, client *http.Client) {
 		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
