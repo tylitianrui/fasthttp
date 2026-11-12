@@ -1,6 +1,7 @@
 package fasthttp
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -12,12 +13,34 @@ func BenchmarkURIParsePathQueryString(b *testing.B) {
 	benchmarkURIParse(b, "google.com", "/foo/bar?query=string&other=value")
 }
 
+func BenchmarkURIParsePathFileExtension(b *testing.B) {
+	benchmarkURIParse(b, "google.com", "/static/js/app.min.js")
+}
+
 func BenchmarkURIParsePathQueryStringHash(b *testing.B) {
 	benchmarkURIParse(b, "google.com", "/foo/bar?query=string&other=value#hashstring")
 }
 
+// A request URI made of nothing but separators or dot segments normalizes to
+// "/", so these measure the cost of getting there rather than the result.
+func BenchmarkURIParsePathSlashRun(b *testing.B) {
+	benchmarkURIParse(b, "google.com", strings.Repeat("/", 8*1024))
+}
+
+func BenchmarkURIParsePathDotSegments(b *testing.B) {
+	benchmarkURIParse(b, "google.com", strings.Repeat("/a/..", 1638))
+}
+
 func BenchmarkURIParseHostname(b *testing.B) {
 	benchmarkURIParse(b, "google.com", "http://foobar.com/foo/bar?query=string&other=value#hashstring")
+}
+
+func BenchmarkURIParseUserinfo(b *testing.B) {
+	benchmarkURIParse(b, "", "http://user:pass@foobar.com/foo/bar")
+}
+
+func BenchmarkURIParseUserinfoEncoded(b *testing.B) {
+	benchmarkURIParse(b, "", "http://user:p%40ss%21@foobar.com/foo/bar")
 }
 
 func BenchmarkURIFullURI(b *testing.B) {
@@ -46,4 +69,13 @@ func benchmarkURIParse(b *testing.B, host, uri string) {
 			u.Parse(strHost, strURI) //nolint:errcheck
 		}
 	})
+}
+
+func BenchmarkStringContainsCTLByte(b *testing.B) {
+	uri := []byte("/api/v1/items?page=2&limit=50&sort=name")
+	for range b.N {
+		if stringContainsCTLByte(uri) {
+			b.Fatal("clean uri flagged")
+		}
+	}
 }

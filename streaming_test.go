@@ -3,6 +3,7 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/valyala/bytebufferpool"
 	"github.com/valyala/fasthttp/fasthttputil"
 )
 
@@ -87,7 +89,7 @@ aaaaaaaaaa`, "\n", "\r\n")
 
 	select {
 	case <-respCh:
-	case <-time.After(time.Second):
+	case <-time.After(testTimeout(time.Second)):
 		t.Fatal("timeout")
 	}
 
@@ -97,7 +99,7 @@ aaaaaaaaaa`, "\n", "\r\n")
 
 	select {
 	case <-ch:
-	case <-time.After(time.Second):
+	case <-time.After(testTimeout(time.Second)):
 		t.Fatal("timeout when waiting for the server to stop")
 	}
 }
@@ -207,10 +209,10 @@ Trailer: Foo, Bar
 	case <-ch:
 		select {
 		case <-ch2:
-		case <-time.After(time.Second):
+		case <-time.After(testTimeout(time.Second)):
 			t.Fatal("timeout when waiting for the server to stop")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testTimeout(time.Second)):
 		t.Fatal("timeout when waiting for the request to be processed")
 	}
 }
@@ -263,4 +265,135 @@ func BenchmarkRequestStreamE2E(b *testing.B) {
 	}
 
 	wg.Wait()
+}
+
+// TestRequestStreamStaysAtEOF verifies that a chunked requestStream keeps
+// returning io.EOF once the terminating chunk has been consumed.
+//
+// Without a terminal state, a second Read re-enters parseChunkSize and waits for
+// another chunk header that is never coming. On a keep-alive connection, which
+// stays open after the response body ends, that read blocks for as long as the
+// peer holds the socket open. Any caller that reads a streamed body to EOF and
+// then reads again - draining before release is the common case - parks a
+// goroutine and never releases the connection.
+func TestRequestStreamStaysAtEOF(t *testing.T) {
+	t.Parallel()
+
+	body := createFixedBody(10)
+	chunked := createChunkedBody(body, nil, true)
+
+	// A pipe that is never closed models a keep-alive connection: the body ends,
+	// but the peer keeps the socket open and sends nothing more.
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write(chunked)
+	}()
+	t.Cleanup(func() { _ = pr.Close() })
+
+	var h ResponseHeader
+	h.SetContentLength(-1)
+
+	bb := bytebufferpool.Get()
+	defer bytebufferpool.Put(bb)
+	rs := acquireRequestStream(bb, bufio.NewReader(pr), &h)
+	defer releaseRequestStream(rs)
+
+	got, err := io.ReadAll(rs)
+	if err != nil {
+		t.Fatalf("unexpected error reading body: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("unexpected body %q. Expecting %q", got, body)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, readErr := rs.Read(make([]byte, 1))
+		done <- readErr
+	}()
+
+	select {
+	case readErr := <-done:
+		if !errors.Is(readErr, io.EOF) {
+			t.Fatalf("unexpected error on read after EOF: %v. Expecting io.EOF", readErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read after EOF blocked waiting for another chunk header")
+	}
+}
+
+func TestRequestStreamChunkedTruncatedAtChunkBoundary(t *testing.T) {
+	t.Parallel()
+
+	// The peer sends a complete chunk, then closes before the last chunk.
+	var h ResponseHeader
+	h.SetContentLength(-1)
+
+	bb := bytebufferpool.Get()
+	defer bytebufferpool.Put(bb)
+	rs := acquireRequestStream(bb, bufio.NewReader(strings.NewReader("5\r\nhello\r\n")), &h)
+	defer releaseRequestStream(rs)
+
+	got, err := io.ReadAll(rs)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("unexpected error: %v. Expecting %v", err, io.ErrUnexpectedEOF)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("unexpected body %q. Expecting %q", got, "hello")
+	}
+}
+
+func TestBodyStreamTruncatedChunkFraming(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, body, want string
+		brokenChunk      bool
+	}{
+		{"missing first chunk", "", "", false},
+		{"missing next chunk", "3\r\nabc\r\n", "abc", false},
+		{"missing trailer terminator", "3\r\nabc\r\n0\r\n", "abc", true},
+		{"unterminated trailer", "3\r\nabc\r\n0\r\nX-Test: value", "abc", true},
+		{"missing blank line after trailer", "3\r\nabc\r\n0\r\nX-Test: value\r\n", "abc", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, response := range []bool{false, true} {
+				t.Run(fmt.Sprintf("response=%v", response), func(t *testing.T) {
+					var req Request
+					var resp Response
+					defer req.Reset()
+					defer resp.Reset()
+					var stream io.Reader
+					const header = "Transfer-Encoding: chunked\r\nTrailer: X-Test\r\n\r\n"
+					if response {
+						resp.StreamBody = true
+						if err := resp.Read(bufio.NewReader(strings.NewReader("HTTP/1.1 200 OK\r\n" + header + tc.body))); err != nil {
+							t.Fatal(err)
+						}
+						stream = resp.BodyStream()
+					} else {
+						br := bufio.NewReader(strings.NewReader("POST / HTTP/1.1\r\nHost: example.com\r\n" + header + tc.body))
+						if err := req.Header.Read(br); err != nil {
+							t.Fatal(err)
+						}
+						if err := req.ContinueReadBodyStream(br, 1, false); err != nil {
+							t.Fatal(err)
+						}
+						stream = req.BodyStream()
+					}
+					got, err := io.ReadAll(stream)
+					if tc.brokenChunk {
+						var broken ErrBrokenChunk
+						if !errors.As(err, &broken) || !errors.Is(broken.error, io.ErrUnexpectedEOF) {
+							t.Fatalf("got %v, want ErrBrokenChunk containing io.ErrUnexpectedEOF", err)
+						}
+					} else if !errors.Is(err, io.ErrUnexpectedEOF) {
+						t.Fatalf("got %v, want io.ErrUnexpectedEOF", err)
+					}
+					if string(got) != tc.want {
+						t.Fatalf("got body %q, want %q", got, tc.want)
+					}
+				})
+			}
+		})
+	}
 }

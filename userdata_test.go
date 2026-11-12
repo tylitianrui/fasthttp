@@ -121,7 +121,7 @@ func TestUserDataSetAndRemove(t *testing.T) {
 	testUserDataGet(t, &u, []byte(longKey), "")
 }
 
-func TestUserData_GC(t *testing.T) {
+func TestUserDataGC(t *testing.T) {
 	t.Parallel()
 
 	var u userData
@@ -142,7 +142,7 @@ func TestUserData_GC(t *testing.T) {
 
 	select {
 	case <-final:
-	case <-time.After(time.Second):
+	case <-time.After(testTimeout(time.Second)):
 		t.Fatalf("value is garbage collected")
 	}
 

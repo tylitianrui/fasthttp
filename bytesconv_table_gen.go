@@ -98,7 +98,7 @@ func main() {
 		return a
 	}()
 
-	validHeaderFieldByteTable := func() [128]byte {
+	validHeaderFieldByteTable := func() [256]byte {
 		// Should match net/textproto's validHeaderFieldByte(c byte) bool
 		// Defined by RFC 7230 and 9110:
 		//
@@ -107,7 +107,7 @@ func main() {
 		//	tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
 		//	        "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
 		//	token = 1*tchar
-		var table [128]byte
+		var table [256]byte
 		for c := 0; c < 128; c++ {
 			if (c >= '0' && c <= '9') ||
 				(c >= 'a' && c <= 'z') ||
@@ -144,6 +144,40 @@ func main() {
 			}
 		}
 		return table
+	}()
+
+	hostShouldEscapeTable := func() [256]byte {
+		// Matches shouldEscape(c, encodeHost) for ASCII bytes. Non-ASCII
+		// bytes are never escaped in a host, see unescape.
+		var a [256]byte
+		for c := 0; c < 0x80; c++ {
+			a[c] = 1
+		}
+		for i := int('a'); i <= int('z'); i++ {
+			a[i] = 0
+		}
+		for i := int('A'); i <= int('Z'); i++ {
+			a[i] = 0
+		}
+		for i := int('0'); i <= int('9'); i++ {
+			a[i] = 0
+		}
+		for _, v := range `!$&'()*+,;=:[]<>"-_.~` {
+			a[v] = 0
+		}
+		return a
+	}()
+
+	argsScanTable := func() [256]byte {
+		// The bytes argsScanner stops at: the '=' and '&' separators, which
+		// map to themselves, and the '%' and '+' escapes, which both map to
+		// '%'. Every other byte maps to zero and is copied as is.
+		var a [256]byte
+		a['='] = '='
+		a['&'] = '&'
+		a['%'] = '%'
+		a['+'] = '%'
+		return a
 	}()
 
 	validMethodValueByteTable := [256]byte{
@@ -250,6 +284,8 @@ func main() {
 	fmt.Fprintf(w, "const validHeaderFieldByteTable = %q\n", validHeaderFieldByteTable)
 	fmt.Fprintf(w, "const validHeaderValueByteTable = %q\n", validHeaderValueByteTable)
 	fmt.Fprintf(w, "const validMethodValueByteTable = %q\n", validMethodValueByteTable)
+	fmt.Fprintf(w, "const hostShouldEscapeTable = %q\n", hostShouldEscapeTable)
+	fmt.Fprintf(w, "const argsScanTable = %q\n", argsScanTable)
 
 	if err := os.WriteFile("bytesconv_table.go", w.Bytes(), 0o660); err != nil {
 		log.Fatal(err)

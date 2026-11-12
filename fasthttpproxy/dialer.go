@@ -21,6 +21,15 @@ var (
 	tmpURL       = &url.URL{Scheme: httpsScheme, Host: "example.com"}
 )
 
+func dialFuncOrError(dialFunc fasthttp.DialFunc, err error) fasthttp.DialFunc {
+	if err == nil {
+		return dialFunc
+	}
+	return func(addr string) (net.Conn, error) {
+		return nil, err
+	}
+}
+
 // Dialer embeds both fasthttp.TCPDialer and httpproxy.Config, allowing it
 // to take advantage of the optimizations provided by fasthttp for dialing while also
 // utilizing the finer-grained configuration options offered by httpproxy.
@@ -71,21 +80,46 @@ type Dialer struct {
 
 // GetDialFunc method returns a fasthttp-style dial function. The useEnv parameter
 // determines whether the proxy address comes from Dialer.Config or from environment variables.
+//
+// The returned DialFunc cannot observe the request scheme. When HTTPProxy and
+// HTTPSProxy differ, it assumes port 443 is HTTPS and every other port is HTTP.
+// Use GetDialFuncForTLS when the request scheme and port may not use their
+// conventional pairing.
 func (d *Dialer) GetDialFunc(useEnv bool) (fasthttp.DialFunc, error) {
+	return d.getDialFunc(useEnv, "")
+}
+
+// GetDialFuncForTLS returns a fasthttp-style dial function that selects
+// HTTPProxy or HTTPSProxy from isTLS instead of inferring the scheme from the
+// destination port. The isTLS value should match fasthttp.HostClient.IsTLS.
+func (d *Dialer) GetDialFuncForTLS(useEnv, isTLS bool) (fasthttp.DialFunc, error) {
+	scheme := httpScheme
+	if isTLS {
+		scheme = httpsScheme
+	}
+	return d.getDialFunc(useEnv, scheme)
+}
+
+func (d *Dialer) getDialFunc(useEnv bool, scheme string) (fasthttp.DialFunc, error) {
 	config := &d.Config
 	if useEnv {
 		config = httpproxy.FromEnvironment()
 	}
-	proxyURLIsSame := config.HTTPSProxy == config.HTTPProxy && config.NoProxy == ""
+	proxyURLIsStatic := config.NoProxy == "" &&
+		(scheme != "" || config.HTTPSProxy == config.HTTPProxy)
 	network := "tcp4"
 	if d.DialDualStack {
 		network = "tcp"
 	}
 	proxyFunc := config.ProxyFunc()
-	if proxyURLIsSame {
+	if proxyURLIsStatic {
 		var proxyURL *url.URL
 		var proxyDialer proxy.Dialer
-		proxyURL, err := proxyFunc(tmpURL)
+		reqURL := tmpURL
+		if scheme != "" {
+			reqURL = &url.URL{Scheme: scheme, Host: tmpURL.Host}
+		}
+		proxyURL, err := proxyFunc(reqURL)
 		if err != nil {
 			return nil, err
 		}
@@ -118,11 +152,14 @@ func (d *Dialer) GetDialFunc(useEnv bool) (fasthttp.DialFunc, error) {
 	return func(addr string) (conn net.Conn, err error) {
 		var proxyDialer proxy.Dialer
 		var proxyURL *url.URL
-		scheme := httpsScheme
-		if !strings.HasSuffix(addr, colonTLSPort) {
-			scheme = httpScheme
+		requestScheme := scheme
+		if requestScheme == "" {
+			requestScheme = httpsScheme
+			if !strings.HasSuffix(addr, colonTLSPort) {
+				requestScheme = httpScheme
+			}
 		}
-		reqURL := &url.URL{Host: addr, Scheme: scheme}
+		reqURL := &url.URL{Host: addr, Scheme: requestScheme}
 		proxyURL, err = proxyFunc(reqURL)
 		if err != nil {
 			return nil, err
@@ -189,7 +226,7 @@ func (d DialerFunc) Dial(network, addr string) (net.Conn, error) {
 // Establish a connection through an HTTP proxy.
 func httpProxyDial(dialer proxy.Dialer, network, addr, proxyAddr, auth string) (net.Conn, error) {
 	if strings.ContainsAny(addr, "\r\n") {
-		return nil, fmt.Errorf("proxy dial target address contains CR or LF: %q", addr)
+		return nil, fmt.Errorf("proxy dial target address contains cr or lf: %q", addr)
 	}
 
 	conn, err := dialer.Dial(network, proxyAddr)
@@ -230,7 +267,7 @@ func httpProxyDial(dialer proxy.Dialer, network, addr, proxyAddr, auth string) (
 	}
 	if res.Header.StatusCode() != 200 {
 		_ = conn.Close()
-		err = fmt.Errorf("could not connect to proxyAddr: %s status code: %d", proxyAddr, res.Header.StatusCode())
+		err = fmt.Errorf("could not connect to proxy addr: %s status code: %d", proxyAddr, res.Header.StatusCode())
 		return nil, err
 	}
 	return conn, err
@@ -249,12 +286,17 @@ func addrAndAuth(pu *url.URL, authCache *sync.Map) (proxyAddr, auth string) {
 	}
 	if authCache != nil {
 		if v, ok := authCache.Load(pu); ok {
-			info := v.(*proxyInfo)
+			info := v.(*proxyInfo) //nolint:forcetypeassert
 			return info.addr, info.auth
 		}
 	}
+	// Send the decoded credentials; User.String() would percent-encode them.
+	credentials := pu.User.Username()
+	if password, ok := pu.User.Password(); ok {
+		credentials += ":" + password
+	}
 	info := &proxyInfo{
-		auth: base64.StdEncoding.EncodeToString([]byte(pu.User.String())),
+		auth: base64.StdEncoding.EncodeToString([]byte(credentials)),
 		addr: pu.Host + pu.Path,
 	}
 	if authCache != nil {

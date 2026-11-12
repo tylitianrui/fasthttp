@@ -3,6 +3,7 @@ package fasthttputil
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -56,24 +57,26 @@ func TestInmemoryListener(t *testing.T) {
 				close(serverCh)
 				return
 			}
-			defer conn.Close()
-			buf := make([]byte, 30)
-			n, err := conn.Read(buf)
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-			buf = buf[:n]
-			if !bytes.HasPrefix(buf, []byte("request_")) {
-				t.Errorf("unexpected request prefix %q. Expecting %q", buf, "request_")
-			}
-			resp := fmt.Sprintf("response_%s", buf[len("request_"):])
-			n, err = conn.Write([]byte(resp))
-			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-			if n != len(resp) {
-				t.Errorf("unexpected number of bytes written: %d. Expecting %d", n, len(resp))
-			}
+			func() {
+				defer conn.Close()
+				buf := make([]byte, 30)
+				n, err := conn.Read(buf)
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				buf = buf[:n]
+				if !bytes.HasPrefix(buf, []byte("request_")) {
+					t.Errorf("unexpected request prefix %q. Expecting %q", buf, "request_")
+				}
+				resp := fmt.Sprintf("response_%s", buf[len("request_"):])
+				n, err = conn.Write([]byte(resp))
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if n != len(resp) {
+					t.Errorf("unexpected number of bytes written: %d. Expecting %d", n, len(resp))
+				}
+			}()
 		}
 	}()
 
@@ -94,6 +97,95 @@ func TestInmemoryListener(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("timeout")
 	}
+}
+
+func TestInmemoryListenerCloseUnblocksPendingDial(t *testing.T) {
+	ln := NewInmemoryListener()
+
+	dialCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Dial()
+		if conn != nil {
+			conn.Close()
+		}
+		dialCh <- err
+	}()
+
+	waitForPendingInmemoryDial(t, ln)
+
+	closeCh := make(chan error, 1)
+	go func() {
+		closeCh <- ln.Close()
+	}()
+
+	select {
+	case err := <-closeCh:
+		if err != nil {
+			t.Fatalf("unexpected close error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for Close")
+	}
+
+	select {
+	case err := <-dialCh:
+		if !errors.Is(err, ErrInmemoryListenerClosed) {
+			t.Fatalf("unexpected dial error: %v. Expecting %v", err, ErrInmemoryListenerClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for Dial")
+	}
+}
+
+func TestInmemoryListenerCloseDropsQueuedDial(t *testing.T) {
+	ln := NewInmemoryListener()
+
+	dialCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Dial()
+		if conn != nil {
+			conn.Close()
+		}
+		dialCh <- err
+	}()
+
+	waitForPendingInmemoryDial(t, ln)
+
+	if err := ln.Close(); err != nil {
+		t.Fatalf("unexpected close error: %v", err)
+	}
+	if queued := len(ln.conns); queued != 0 {
+		t.Fatalf("unexpected queued conns after Close: %d. Expecting 0", queued)
+	}
+
+	conn, err := ln.Accept()
+	if conn != nil {
+		conn.Close()
+	}
+	if !errors.Is(err, ErrInmemoryListenerClosed) {
+		t.Fatalf("unexpected accept error: %v. Expecting %v", err, ErrInmemoryListenerClosed)
+	}
+
+	select {
+	case err := <-dialCh:
+		if !errors.Is(err, ErrInmemoryListenerClosed) {
+			t.Fatalf("unexpected dial error: %v. Expecting %v", err, ErrInmemoryListenerClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for Dial")
+	}
+}
+
+func waitForPendingInmemoryDial(t *testing.T, ln *InmemoryListener) {
+	t.Helper()
+
+	for range 100 {
+		if len(ln.conns) > 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for pending dial")
 }
 
 // echoServerHandler implements http.Handler.

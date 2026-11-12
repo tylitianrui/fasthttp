@@ -15,6 +15,271 @@ func TestCookiePanic(t *testing.T) {
 	}
 }
 
+func TestCookieSettersSanitizeNewLines(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		set  func(c *Cookie)
+	}{
+		{
+			name: "set key",
+			set:  func(c *Cookie) { c.SetKey("sid\r\nSet-Cookie: admin=1") },
+		},
+		{
+			name: "set key bytes",
+			set:  func(c *Cookie) { c.SetKeyBytes([]byte("sid\r\nSet-Cookie: admin=1")) },
+		},
+		{
+			name: "set value",
+			set:  func(c *Cookie) { c.SetValue("abc\r\nSet-Cookie: admin=1") },
+		},
+		{
+			name: "set value bytes",
+			set:  func(c *Cookie) { c.SetValueBytes([]byte("abc\r\nSet-Cookie: admin=1")) },
+		},
+		{
+			name: "set domain",
+			set:  func(c *Cookie) { c.SetDomain("example.com\r\nSet-Cookie: admin=1") },
+		},
+		{
+			name: "set domain bytes",
+			set:  func(c *Cookie) { c.SetDomainBytes([]byte("example.com\r\nSet-Cookie: admin=1")) },
+		},
+		{
+			name: "set path",
+			set:  func(c *Cookie) { c.SetPath("/account\r\nSet-Cookie: admin=1") },
+		},
+		{
+			name: "set path bytes",
+			set:  func(c *Cookie) { c.SetPathBytes([]byte("/account\r\nSet-Cookie: admin=1")) },
+		},
+		{
+			name: "set path encoded new line",
+			set:  func(c *Cookie) { c.SetPath("/account%0d%0aSet-Cookie:%20admin=1") },
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c Cookie
+			c.SetKey("sid")
+			c.SetValue("abc")
+			c.SetDomain("example.com")
+			c.SetPath("/")
+
+			tc.set(&c)
+
+			s := c.String()
+			if strings.ContainsAny(s, "\r\n") {
+				t.Fatalf("unexpected newline in cookie %q", s)
+			}
+		})
+	}
+}
+
+func TestCookieSettersSanitizeSemicolons(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		set  func(c *Cookie)
+		get  func(c *Cookie) []byte
+	}{
+		{
+			name: "set key",
+			set:  func(c *Cookie) { c.SetKey("sid; Secure") },
+			get:  (*Cookie).Key,
+		},
+		{
+			name: "set key bytes",
+			set:  func(c *Cookie) { c.SetKeyBytes([]byte("sid; Secure")) },
+			get:  (*Cookie).Key,
+		},
+		{
+			name: "set value",
+			set:  func(c *Cookie) { c.SetValue("abc; Secure") },
+			get:  (*Cookie).Value,
+		},
+		{
+			name: "set value bytes",
+			set:  func(c *Cookie) { c.SetValueBytes([]byte("abc; Secure")) },
+			get:  (*Cookie).Value,
+		},
+		{
+			name: "set domain",
+			set:  func(c *Cookie) { c.SetDomain("example.com; Secure") },
+			get:  (*Cookie).Domain,
+		},
+		{
+			name: "set domain bytes",
+			set:  func(c *Cookie) { c.SetDomainBytes([]byte("example.com; Secure")) },
+			get:  (*Cookie).Domain,
+		},
+		{
+			name: "set path",
+			set:  func(c *Cookie) { c.SetPath("/account; Secure") },
+			get:  (*Cookie).Path,
+		},
+		{
+			name: "set path bytes",
+			set:  func(c *Cookie) { c.SetPathBytes([]byte("/account; Secure")) },
+			get:  (*Cookie).Path,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var c Cookie
+			c.SetKey("sid")
+			c.SetValue("abc")
+			c.SetDomain("example.com")
+			c.SetPath("/")
+
+			tc.set(&c)
+
+			if strings.Contains(string(tc.get(&c)), ";") {
+				t.Fatalf("%s left a ';' that can inject attributes: %q", tc.name, c.Cookie())
+			}
+
+			var got Cookie
+			if err := got.ParseBytes(c.Cookie()); err != nil {
+				t.Fatalf("cannot parse produced cookie %q: %v", c.Cookie(), err)
+			}
+			if got.Secure() {
+				t.Fatalf("%s injected a Secure attribute: %q", tc.name, c.Cookie())
+			}
+		})
+	}
+}
+
+func TestCookieParseSanitizesNewLines(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	err := c.Parse("sid=abc\r\nSet-Cookie: admin=1; Domain=example.com\r\nSet-Cookie: admin=1; Path=/account\r\nSet-Cookie: admin=1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	s := c.String()
+	if strings.ContainsAny(s, "\r\n") {
+		t.Fatalf("unexpected newline in cookie %q", s)
+	}
+}
+
+func TestCookieParseRejectsInvalidQuotedValue(t *testing.T) {
+	t.Parallel()
+
+	testCases := []string{
+		`session="abc; Domain=evil.com`,
+		`session=abc"; Domain=evil.com`,
+		`session="abc\"; Domain=evil.com`,
+	}
+
+	for _, tc := range testCases {
+		var c Cookie
+		if err := c.Parse(tc); err != ErrInvalidCookieValue {
+			t.Fatalf("unexpected error %v. Expecting %v. Cookie %q", err, ErrInvalidCookieValue, tc)
+		}
+		if len(c.Domain()) != 0 {
+			t.Fatalf("unexpected domain %q parsed from invalid cookie %q", c.Domain(), tc)
+		}
+	}
+}
+
+// A Domain or Path that can't be used is ignored, like an Expires or Max-Age
+// that isn't valid (RFC 6265, section 5.2): the cookie is kept, it gets no
+// such attribute, and the attributes after it are still parsed.
+func TestCookieParseIgnoresInvalidAttributeValue(t *testing.T) {
+	t.Parallel()
+
+	// Domain values reject the quoted-string bytes (" ; \), the same set as the
+	// primary cookie value, since none are legal in a hostname.
+	domainCases := []string{
+		`sid=ok; Domain=victim.example"`,
+		`sid=ok; Domain=e"vil.example`,
+		`sid=ok; Domain=e\vil.example`,
+	}
+	for _, tc := range domainCases {
+		var c Cookie
+		if err := c.Parse(tc + "; Path=/after; Secure; HttpOnly"); err != nil {
+			t.Fatalf("unexpected error %v. Cookie %q", err, tc)
+		}
+		if len(c.Domain()) != 0 {
+			t.Fatalf("unexpected domain %q parsed from invalid attribute %q", c.Domain(), tc)
+		}
+		if string(c.Key()) != "sid" || string(c.Value()) != "ok" {
+			t.Fatalf("unexpected cookie %q=%q parsed from %q", c.Key(), c.Value(), tc)
+		}
+		if string(c.Path()) != "/after" || !c.Secure() || !c.HTTPOnly() {
+			t.Fatalf("attributes after the invalid Domain were lost: path=%q secure=%v httponly=%v. Cookie %q",
+				c.Path(), c.Secure(), c.HTTPOnly(), tc)
+		}
+	}
+
+	// Path values reject the ';' separator and every byte outside 0x20-0x7e,
+	// matching net/http's validCookiePathByte; '"' and '\' stay valid there.
+	pathCases := []string{
+		"sid=ok; Path=/a\x01b",
+		"sid=ok; Path=/a\x7fb",
+		"sid=ok; Path=/a\x80b",
+		"sid=ok; Path=/caf\xc3\xa9",
+		"sid=ok; Path=/a\xffb",
+	}
+	for _, tc := range pathCases {
+		var c Cookie
+		if err := c.Parse(tc + "; Domain=example.com; Secure; HttpOnly"); err != nil {
+			t.Fatalf("unexpected error %v. Cookie %q", err, tc)
+		}
+		if len(c.Path()) != 0 {
+			t.Fatalf("unexpected path %q parsed from invalid attribute %q", c.Path(), tc)
+		}
+		if string(c.Key()) != "sid" || string(c.Value()) != "ok" {
+			t.Fatalf("unexpected cookie %q=%q parsed from %q", c.Key(), c.Value(), tc)
+		}
+		if string(c.Domain()) != "example.com" || !c.Secure() || !c.HTTPOnly() {
+			t.Fatalf("attributes after the invalid Path were lost: domain=%q secure=%v httponly=%v. Cookie %q",
+				c.Domain(), c.Secure(), c.HTTPOnly(), tc)
+		}
+	}
+
+	// A later attribute that can't be used does not undo an earlier one that can,
+	// the same as for an invalid Max-Age.
+	var last Cookie
+	if err := last.Parse(`sid=ok; Domain=trusted.example; Path=/app; Domain=e"vil.example; Path=/a` + "\x01"); err != nil {
+		t.Fatalf("unexpected error %v", err)
+	}
+	if string(last.Domain()) != "trusted.example" || string(last.Path()) != "/app" {
+		t.Fatalf("unexpected domain %q path %q. Expecting the valid ones before the invalid ones", last.Domain(), last.Path())
+	}
+
+	// A backslash in Path is accepted and round-trips, matching SetPath.
+	var rt Cookie
+	rt.SetKey("sid")
+	rt.SetValue("ok")
+	rt.SetPath(`/a\b`)
+	var parsed Cookie
+	if err := parsed.ParseBytes(rt.Cookie()); err != nil {
+		t.Fatalf("unexpected error %v round-tripping a backslash path", err)
+	}
+	if string(parsed.Path()) != `/a\b` {
+		t.Fatalf("unexpected path %q, expecting %q", parsed.Path(), `/a\b`)
+	}
+
+	// A balanced quoted attribute is unquoted during the trim pass and stays valid.
+	var c Cookie
+	if err := c.Parse(`sid=ok; Domain="trusted.example"; Path="/app"`); err != nil {
+		t.Fatalf("unexpected error %v for balanced quoted attributes", err)
+	}
+	if string(c.Domain()) != "trusted.example" {
+		t.Fatalf("unexpected domain %q", c.Domain())
+	}
+	if string(c.Path()) != "/app" {
+		t.Fatalf("unexpected path %q", c.Path())
+	}
+}
+
 func TestCookieValueWithEqualAndSpaceChars(t *testing.T) {
 	t.Parallel()
 
@@ -298,7 +563,7 @@ func TestCookieAcquireReleaseConcurrent(t *testing.T) {
 	for range 10 {
 		select {
 		case <-ch:
-		case <-time.After(time.Second):
+		case <-time.After(testTimeout(time.Second)):
 			t.Fatalf("timeout")
 		}
 	}
@@ -407,6 +672,14 @@ func TestParseRequestCookies(t *testing.T) {
 	testParseRequestCookies(t, "   %D0%B8%D0%B2%D0%B5%D1%82=a%20b%3Bc   ;s%20s=aaa  ", "%D0%B8%D0%B2%D0%B5%D1%82=a%20b%3Bc; s%20s=aaa")
 }
 
+func TestParseRequestCookiesSkipsInvalidQuotedValues(t *testing.T) {
+	t.Parallel()
+
+	testParseRequestCookies(t, `session="abc; admin=true`, "admin=true")
+	testParseRequestCookies(t, `session=abc"; admin=true`, "admin=true")
+	testParseRequestCookies(t, `session="abc\"; admin=true`, "admin=true")
+}
+
 func testParseRequestCookies(t *testing.T, s, expectedS string) {
 	cookies := parseRequestCookies(nil, []byte(s))
 	ss := string(appendRequestCookieBytes(nil, cookies))
@@ -446,5 +719,214 @@ func testAppendRequestCookieBytes(t *testing.T, s, expectedS string) {
 	result = result[len(prefix):]
 	if result != expectedS {
 		t.Fatalf("Unexpected result %q. Expecting %q for cookie %q", result, expectedS, s)
+	}
+}
+
+func TestCookieParseInvalidExpires(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	for _, tc := range []struct {
+		name   string
+		input  string
+		expire time.Time
+		output string
+	}{
+		{"later attributes", "foo=bar; expires=never; path=/; Secure; HttpOnly", CookieExpireUnlimited, "foo=bar; path=/; HttpOnly; secure"},
+		{"garbage", "foo=bar; expires=0; samesite=strict", CookieExpireUnlimited, "foo=bar; SameSite=Strict"},
+		{"empty", "foo=bar; expires=; domain=example.com", CookieExpireUnlimited, "foo=bar; domain=example.com"},
+		{"valid kept", "foo=bar; expires=Tue, 10 Nov 2009 23:00:00 GMT; expires=bogus", time.Date(2009, time.November, 10, 23, 0, 0, 0, time.UTC), "foo=bar; expires=Tue, 10 Nov 2009 23:00:00 GMT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := c.Parse(tc.input); err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if got := c.Expire(); !got.Equal(tc.expire) {
+				t.Errorf("unexpected expire: got %v, want %v", got, tc.expire)
+			}
+			if got := c.String(); got != tc.output {
+				t.Errorf("unexpected cookie: got %q, want %q", got, tc.output)
+			}
+		})
+	}
+}
+
+func TestCookieParseExpiresTimeZone(t *testing.T) {
+	t.Parallel()
+
+	expire := time.Date(2009, time.November, 10, 23, 0, 0, 0, time.UTC)
+	var c Cookie
+	for _, input := range []string{
+		"foo=bar; expires=Tue, 10 Nov 2009 23:00:00 GMT",
+		"foo=bar; expires=Tue, 10 Nov 2009 23:00:00 UTC",
+		"foo=bar; expires=Tue, 10-Nov-2009 23:00:00 GMT",
+		"foo=bar; expires=Tue, 10-Nov-2009 23:00:00 UTC",
+	} {
+		if err := c.Parse(input); err != nil {
+			t.Fatalf("unexpected parse error for %q: %v", input, err)
+		}
+		if got := c.Expire(); !got.Equal(expire) {
+			t.Errorf("unexpected expire for %q: got %v, want %v", input, got, expire)
+		}
+	}
+}
+
+func TestCookieParseZeroMaxAge(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	for _, tc := range []struct {
+		name   string
+		input  string
+		maxAge int
+		output string
+	}{
+		{"zero", "foo=bar; max-age=0", -1, "foo=bar; max-age=0"},
+		{"case insensitive", "foo=bar; Max-Age=0", -1, "foo=bar; max-age=0"},
+		{"expires", "foo=bar; expires=Wed, 10 Nov 2027 23:00:00 GMT; max-age=0", -1, "foo=bar; max-age=0"},
+		{"zero overrides positive", "foo=bar; max-age=100; max-age=0", -1, "foo=bar; max-age=0"},
+		{"positive overrides zero", "foo=bar; max-age=0; max-age=100", 100, "foo=bar; max-age=100"},
+		{"absent", "foo=bar", 0, "foo=bar"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := c.Parse(tc.input); err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if got := c.MaxAge(); got != tc.maxAge {
+				t.Errorf("unexpected max age: got %d, want %d", got, tc.maxAge)
+			}
+			if got := c.String(); got != tc.output {
+				t.Errorf("unexpected cookie: got %q, want %q", got, tc.output)
+			}
+		})
+	}
+}
+
+func TestCookieParseNegativeMaxAge(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	for _, tc := range []struct {
+		name   string
+		input  string
+		maxAge int
+		output string
+	}{
+		{"negative", "foo=bar; max-age=-1", -1, "foo=bar; max-age=0"},
+		{"case insensitive", "foo=bar; Max-Age=-3600", -1, "foo=bar; max-age=0"},
+		{"negative zero", "foo=bar; max-age=-0", -1, "foo=bar; max-age=0"},
+		{"later attributes", "foo=bar; max-age=-1; path=/; HttpOnly", -1, "foo=bar; max-age=0; path=/; HttpOnly"},
+		{"expires", "foo=bar; expires=Wed, 10 Nov 2027 23:00:00 GMT; max-age=-1", -1, "foo=bar; max-age=0"},
+		{"negative overrides positive", "foo=bar; max-age=100; max-age=-1", -1, "foo=bar; max-age=0"},
+		{"positive overrides negative", "foo=bar; max-age=-1; max-age=100", 100, "foo=bar; max-age=100"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := c.Parse(tc.input); err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if got := c.MaxAge(); got != tc.maxAge {
+				t.Errorf("unexpected max age: got %d, want %d", got, tc.maxAge)
+			}
+			if got := c.String(); got != tc.output {
+				t.Errorf("unexpected cookie: got %q, want %q", got, tc.output)
+			}
+		})
+	}
+}
+
+func TestCookieParseInvalidMaxAge(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	for _, tc := range []struct {
+		name   string
+		input  string
+		maxAge int
+		output string
+	}{
+		{"later attributes", "foo=bar; max-age=never; path=/; Secure; HttpOnly", 0, "foo=bar; path=/; HttpOnly; secure"},
+		{"empty", "foo=bar; max-age=; domain=example.com", 0, "foo=bar; domain=example.com"},
+		{"fraction", "foo=bar; max-age=1.5; samesite=strict", 0, "foo=bar; SameSite=Strict"},
+		{"overflow", "foo=bar; max-age=99999999999999999999; secure", 0, "foo=bar; secure"},
+		{"sign only", "foo=bar; max-age=-", 0, "foo=bar"},
+		{"double sign", "foo=bar; max-age=--1", 0, "foo=bar"},
+		{"negative garbage", "foo=bar; max-age=-1s", 0, "foo=bar"},
+		{"valid kept", "foo=bar; max-age=100; max-age=bogus", 100, "foo=bar; max-age=100"},
+		{"expires kept", "foo=bar; expires=Tue, 10 Nov 2009 23:00:00 GMT; max-age=bogus", 0, "foo=bar; expires=Tue, 10 Nov 2009 23:00:00 GMT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := c.Parse(tc.input); err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if got := c.MaxAge(); got != tc.maxAge {
+				t.Errorf("unexpected max age: got %d, want %d", got, tc.maxAge)
+			}
+			if got := c.String(); got != tc.output {
+				t.Errorf("unexpected cookie: got %q, want %q", got, tc.output)
+			}
+		})
+	}
+}
+
+func TestCookieParseFlagsWithValue(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	for _, tc := range []struct {
+		name   string
+		input  string
+		output string
+	}{
+		{"empty values", "foo=bar; Secure=; HttpOnly=; Partitioned=", "foo=bar; HttpOnly; secure; Partitioned"},
+		{"values", "foo=bar; secure=true; httponly=1; partitioned=yes", "foo=bar; HttpOnly; secure; Partitioned"},
+		{"later attributes", "foo=bar; Secure=1; HttpOnly=1; Partitioned=1; path=/", "foo=bar; path=/; HttpOnly; secure; Partitioned"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := c.Parse(tc.input); err != nil {
+				t.Fatalf("unexpected parse error: %v", err)
+			}
+			if !c.Secure() {
+				t.Error("Secure must be set")
+			}
+			if !c.HTTPOnly() {
+				t.Error("HttpOnly must be set")
+			}
+			if !c.Partitioned() {
+				t.Error("Partitioned must be set")
+			}
+			if got := c.String(); got != tc.output {
+				t.Errorf("unexpected cookie: got %q, want %q", got, tc.output)
+			}
+		})
+	}
+}
+
+func TestCookieParseTrimsTabs(t *testing.T) {
+	t.Parallel()
+
+	var c Cookie
+	if err := c.Parse("sid\t=\tabc\t;\tPath=/;\tSecure;\tHttpOnly\t"); err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if string(c.Key()) != "sid" {
+		t.Errorf("unexpected key: %q", c.Key())
+	}
+	if string(c.Value()) != "abc" {
+		t.Errorf("unexpected value: %q", c.Value())
+	}
+	if string(c.Path()) != "/" {
+		t.Errorf("unexpected path: %q", c.Path())
+	}
+	if !c.Secure() {
+		t.Error("Secure must be set")
+	}
+	if !c.HTTPOnly() {
+		t.Error("HttpOnly must be set")
+	}
+
+	var h RequestHeader
+	h.Set(HeaderCookie, "a=b;\tc=d")
+	if v := h.Cookie("c"); string(v) != "d" {
+		t.Errorf("unexpected request cookie value: %q", v)
 	}
 }

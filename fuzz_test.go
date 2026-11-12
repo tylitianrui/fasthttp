@@ -115,6 +115,10 @@ func FuzzURIParse(f *testing.F) {
 	f.Add(`http://foobar.com/aaa/bb?cc#dd`)
 	f.Add(`http://google.com?github.com`)
 	f.Add(`http://google.com#@github.com`)
+	// Hosts hiding an uppercase letter and a non-UTF-8 byte behind
+	// percent-encoding, see the host comparison below.
+	f.Add(`http://[%255%2c%2c%2c%2c%4c%2c2c%2c%2c]`)
+	f.Add(`http://aa0aaa%80000000000`)
 
 	f.Fuzz(func(t *testing.T, uri string) {
 		// Limit the size of the URI to avoid OOMs or timeouts.
@@ -141,8 +145,15 @@ func FuzzURIParse(f *testing.F) {
 			return
 		}
 
-		if string(u.Host()) != nu.Host {
-			t.Fatalf("%q: unexpected host: %q. Expecting %q", uri, u.Host(), nu.Host)
+		// fasthttp lowercases the host after unescaping it, net/url keeps
+		// the case of percent-decoded bytes, and the ToLower above cannot
+		// reach them ("%4c" decodes to 'L'). Lower the expectation the same
+		// way fasthttp does; strings.ToLower would mangle non-UTF-8 bytes
+		// like a decoded "%80".
+		expectedHost := []byte(nu.Host)
+		lowercaseBytes(expectedHost)
+		if !bytes.Equal(u.Host(), expectedHost) {
+			t.Fatalf("%q: unexpected host: %q. Expecting %q", uri, u.Host(), expectedHost)
 		}
 		if string(u.QueryString()) != nu.RawQuery {
 			t.Fatalf("%q: unexpected query string: %q. Expecting %q", uri, u.QueryString(), nu.RawQuery)
@@ -150,7 +161,7 @@ func FuzzURIParse(f *testing.F) {
 	})
 }
 
-func FuzzTestHeaderScanner(f *testing.F) {
+func FuzzHeaderScanner(f *testing.F) {
 	f.Add([]byte("Host: example.com\r\nUser-Agent: Go-http-client/1.1\r\nAccept-Encoding: gzip, deflate\r\n\r\n"))
 	f.Add([]byte("Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 27\r\n\r\nname=John+Doe&age=30"))
 	f.Add([]byte(" 3 :\r\n\r\n"))
@@ -180,6 +191,7 @@ func FuzzTestHeaderScanner(f *testing.F) {
 			for _, c := range s.value {
 				if !validHeaderValueByte(c) {
 					s.err = fmt.Errorf("malformed MIME header: invalid byte %q in value %q for key %q", c, s.value, s.key)
+					break
 				}
 			}
 			if s.err != nil {
@@ -210,6 +222,7 @@ func FuzzTestHeaderScanner(f *testing.F) {
 func FuzzRequestReadLimitBodyAllocations(f *testing.F) {
 	f.Add([]byte("POST /a HTTP/1.1\r\nHost: a.com\r\nTransfer-Encoding: chunked\r\nContent-Type: aa\r\n\r\n6\r\nfoobar\r\n3\r\nbaz\r\n0\r\nfoobar\r\n\r\n"), 1024)
 	f.Add([]byte("POST /a HTTP/1.1\r\nHost: a.com\r\nWithTabs: \t v1 \t\r\nWithTabs-Start: \t \t v1 \r\nWithTabs-End: v1 \t \t\t\t\r\nWithTabs-Multi-Line: \t v1 \t;\r\n \t v2 \t;\r\n\t v3\r\n\r\n"), 1024)
+	f.Add([]byte("0 * HTTP/1.1\nHost:0\nTrAnsfer-EnCoding:Chunked\n\n36\r\n"+strings.Repeat("0", 54)+"\r\n2\r\n00\r\nC\r\n000000000000\r\n0\r\n\r\n"), 1101)
 
 	f.Fuzz(func(t *testing.T, body []byte, maxBodySize int) {
 		if len(body) > 1024*1024 || maxBodySize > 1024*1024 {
@@ -222,7 +235,9 @@ func FuzzRequestReadLimitBodyAllocations(f *testing.F) {
 
 		t.Logf("%d %q", maxBodySize, body)
 
-		req := Request{}
+		// Keep the warmed body buffer on this request. The adaptive global
+		// pool can discard larger buffers after long fuzz runs.
+		req := Request{keepBodyBuffer: true}
 		a := bytes.NewReader(body)
 		b := bufio.NewReader(a)
 
@@ -235,7 +250,9 @@ func FuzzRequestReadLimitBodyAllocations(f *testing.F) {
 			a.Reset(body)
 			b.Reset(a)
 
-			_ = req.ReadLimitBody(b, maxBodySize)
+			if err := req.ReadLimitBody(b, maxBodySize); err != nil {
+				t.Fatal(err)
+			}
 		})
 
 		if n != 0 {

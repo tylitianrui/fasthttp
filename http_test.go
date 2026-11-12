@@ -9,9 +9,14 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +26,9 @@ import (
 func TestInvalidTrailers(t *testing.T) {
 	t.Parallel()
 
-	if err := (&Response{}).Read(bufio.NewReader(strings.NewReader("HTTP/1.1 200\r\nTransfer-Encoding:\xff\n\n0\r\n0"))); !errors.Is(err, io.EOF) {
+	// The scanner rejects the unknown transfer-encoding as soon as its line
+	// is complete instead of waiting for the header block terminator.
+	if err := (&Response{}).Read(bufio.NewReader(strings.NewReader("HTTP/1.1 200\r\nTransfer-Encoding:\xff\n\n0\r\n0"))); err == nil || !strings.Contains(err.Error(), "unsupported transfer-encoding") {
 		t.Errorf("%#v", err)
 	}
 	if err := (&Response{}).Read(bufio.NewReader(strings.NewReader("HTTP/1.1 200 OK\r\nTRaILeR:,\r\n\r\n"))); !errors.Is(err, ErrBadTrailer) {
@@ -32,19 +39,30 @@ func TestInvalidTrailers(t *testing.T) {
 	}
 }
 
-func TestResponseEmptyTransferEncoding(t *testing.T) {
+func TestResponseEmptyTransferEncodingError(t *testing.T) {
 	t.Parallel()
 
 	var r Response
 
-	body := "Some body"
-	br := bufio.NewReader(bytes.NewBufferString("HTTP/1.1 200 OK\r\nContent-Type: aaa\r\nTransfer-Encoding: \r\nContent-Length: 9\r\n\r\n" + body))
-	err := r.Read(br)
-	if err != nil {
-		t.Fatal(err)
+	response := "HTTP/1.1 200 OK\r\nContent-Type: aaa\r\nTransfer-Encoding: \r\nContent-Length: 9\r\n\r\nSome body"
+	br := bufio.NewReader(bytes.NewBufferString(response))
+	if err := r.Read(br); err == nil {
+		t.Fatal("expected an error")
 	}
-	if got := string(r.Body()); got != body {
-		t.Fatalf("expected %q got %q", body, got)
+	expectNetHTTPReadResponseError(t, response, "net/http accepted response with empty Transfer-Encoding")
+}
+
+func expectNetHTTPReadResponseError(t *testing.T, response, msg string) {
+	t.Helper()
+
+	resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(response)), nil)
+	if resp != nil && resp.Body != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			t.Fatalf("cannot close response body: %v", closeErr)
+		}
+	}
+	if err == nil {
+		t.Fatal(msg)
 	}
 }
 
@@ -132,7 +150,164 @@ func TestRequestCopyTo(t *testing.T) {
 	if err := req.Read(br); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	req.DisableRedirectPathNormalizing = true
 	testRequestCopyTo(t, &req)
+}
+
+func TestRequestCopyToMultipartForm(t *testing.T) {
+	t.Parallel()
+
+	const body = "--foobar\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n" +
+		"--foobar\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\nfile content\r\n" +
+		"--foobar--\r\n"
+	raw := fmt.Sprintf("POST /upload HTTP/1.1\r\nHost: test.com\r\nContent-Type: multipart/form-data; boundary=foobar\r\nContent-Length: %d\r\n\r\n%s",
+		len(body), body)
+
+	tests := []struct {
+		// read puts the request in the state where its body is only a parsed
+		// multipart form, which is what the server leaves it in.
+		read func(t *testing.T, req *Request)
+		name string
+	}{
+		{
+			name: "parsed while reading",
+			read: func(t *testing.T, req *Request) {
+				if err := req.Read(bufio.NewReader(strings.NewReader(raw))); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			},
+		},
+		{
+			// What a server with StreamRequestBody does: a form of known size is
+			// parsed ahead of the handler there too.
+			name: "parsed while reading with a body stream",
+			read: func(t *testing.T, req *Request) {
+				br := bufio.NewReader(strings.NewReader(raw))
+				if err := req.Header.Read(br); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := req.ContinueReadBodyStream(br, 1<<20); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var req Request
+			tt.read(t, &req)
+			defer req.RemoveMultipartFormFiles()
+			if !req.onlyMultipartForm() {
+				t.Fatal("expecting a request with nothing of its body left but the parsed form")
+			}
+
+			var dst Request
+			req.CopyTo(&dst)
+			defer dst.RemoveMultipartFormFiles()
+
+			if got, want := dst.Body(), req.Body(); len(got) == 0 || !bytes.Equal(got, want) {
+				t.Fatalf("unexpected body of the copy %q. Expecting %q", got, want)
+			}
+			if got, want := dst.String(), req.String(); got != want {
+				t.Fatalf("unexpected copy:\n%q\nExpecting:\n%q", got, want)
+			}
+
+			// The copy holds the body, not the form: it parses its own.
+			if dst.multipartForm != nil {
+				t.Fatal("the copy shares the multipart form of the original")
+			}
+			f, err := dst.MultipartForm()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := f.Value["field"]; len(got) != 1 || got[0] != "value" {
+				t.Fatalf("unexpected field %q. Expecting %q", got, "value")
+			}
+			files := f.File["file"]
+			if len(files) != 1 || files[0].Filename != "a.txt" {
+				t.Fatalf("unexpected files %v", files)
+			}
+			fh, err := files[0].Open()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			defer fh.Close()
+			content, err := io.ReadAll(fh)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if string(content) != "file content" {
+				t.Fatalf("unexpected file content %q. Expecting %q", content, "file content")
+			}
+
+			// Dropping the form of the copy leaves the original alone.
+			dst.RemoveMultipartFormFiles()
+			if req.multipartForm == nil || len(req.Body()) == 0 {
+				t.Fatal("removing the form of the copy changed the original")
+			}
+		})
+	}
+}
+
+// A form whose parts can't be read back has no body to copy. The copy must
+// end up without one, not with whatever the failed attempt wrote.
+func TestRequestCopyToMultipartFormUnreadableFile(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	req.multipartFormBoundary = "foobar"
+	req.multipartForm = &multipart.Form{
+		Value: map[string][]string{"field": {"value"}},
+		File: map[string][]*multipart.FileHeader{
+			// There is no content behind it, so opening it fails.
+			"file": {{Filename: "gone.txt", Header: textproto.MIMEHeader{"Content-Disposition": {`form-data; name="file"; filename="gone.txt"`}}}},
+		},
+	}
+	if !req.onlyMultipartForm() {
+		t.Fatal("expecting a request with nothing of its body left but the parsed form")
+	}
+
+	var dst Request
+	dst.SetBodyString("previous body")
+	req.CopyTo(&dst)
+	if got := dst.Body(); len(got) != 0 {
+		t.Fatalf("unexpected body of the copy %q. Expecting none", got)
+	}
+}
+
+// A body that was kept next to its form is copied as it is, the form is
+// parsed again by the copy when it is asked for.
+func TestRequestCopyToMultipartFormFromBody(t *testing.T) {
+	t.Parallel()
+
+	const body = "--foobar\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n--foobar--\r\n"
+
+	var req Request
+	req.Header.SetContentType("multipart/form-data; boundary=foobar")
+	req.SetBodyString(body)
+	if _, err := req.MultipartForm(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer req.RemoveMultipartFormFiles()
+	if req.onlyMultipartForm() {
+		t.Fatal("expecting the body to be kept")
+	}
+
+	var dst Request
+	req.CopyTo(&dst)
+	defer dst.RemoveMultipartFormFiles()
+	if got := string(dst.Body()); got != body {
+		t.Fatalf("unexpected body of the copy %q. Expecting %q", got, body)
+	}
+	f, err := dst.MultipartForm()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := f.Value["field"]; len(got) != 1 || got[0] != "value" {
+		t.Fatalf("unexpected field %q. Expecting %q", got, "value")
+	}
 }
 
 func TestResponseCopyTo(t *testing.T) {
@@ -156,7 +331,9 @@ func testRequestCopyTo(t *testing.T, src *Request) {
 	src.CopyTo(&dst)
 
 	// Compare serialized representations.
-	if src.String() != dst.String() || !bytes.Equal(src.Body(), dst.Body()) {
+	if src.String() != dst.String() ||
+		!bytes.Equal(src.Body(), dst.Body()) ||
+		src.DisableRedirectPathNormalizing != dst.DisableRedirectPathNormalizing {
 		t.Fatalf("RequestCopyTo fail, src: \n%+v\ndst: \n%+v\n", src, &dst)
 	}
 }
@@ -165,7 +342,11 @@ func testResponseCopyTo(t *testing.T, src *Response) {
 	var dst Response
 	src.CopyTo(&dst)
 
-	if !reflect.DeepEqual(src, &dst) {
+	if !reflect.DeepEqual(&src.Header, &dst.Header) ||
+		!bytes.Equal(src.Body(), dst.Body()) ||
+		src.SkipBody != dst.SkipBody ||
+		!reflect.DeepEqual(src.raddr, dst.raddr) ||
+		!reflect.DeepEqual(src.laddr, dst.laddr) {
 		t.Fatalf("ResponseCopyTo fail, src: \n%+v\ndst: \n%+v\n", src, &dst)
 	}
 }
@@ -282,6 +463,373 @@ func testResponseBodyStreamWithTrailer(t *testing.T, body []byte, disableNormali
 		r := resp2.Header.Peek(k)
 		if string(r) != v {
 			t.Fatalf("unexpected trailer header %q: %q. Expecting %q", kBytes, r, v)
+		}
+	}
+}
+
+func TestRequestBufferedBodyWithTrailer(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{"", "data"} {
+		var req1 Request
+		req1.Header.SetMethod(MethodPost)
+		req1.SetRequestURI("http://example.com/upload")
+		req1.SetBodyString(body)
+		if err := req1.Header.AddTrailer("Foo"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		req1.Header.Set("Foo", "testfoo")
+
+		w := &bytes.Buffer{}
+		bw := bufio.NewWriter(w)
+		if err := req1.Write(bw); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		wire := w.String()
+		if !strings.Contains(wire, "Transfer-Encoding: chunked\r\n") {
+			t.Fatalf("expected chunked transfer encoding, got:\n%q", wire)
+		}
+		if strings.Contains(wire, "Content-Length:") {
+			t.Fatalf("expected no content length, got:\n%q", wire)
+		}
+		if !strings.Contains(wire, "Trailer: Foo\r\n") {
+			t.Fatalf("expected the Trailer header, got:\n%q", wire)
+		}
+		if !strings.HasSuffix(wire, "0\r\nFoo: testfoo\r\n\r\n") {
+			t.Fatalf("expected the trailer after the last chunk, got:\n%q", wire)
+		}
+
+		var req2 Request
+		if err := req2.Read(bufio.NewReader(w)); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(req2.Body()) != body {
+			t.Fatalf("unexpected body: %q. Expecting %q", req2.Body(), body)
+		}
+		if got := string(req2.Header.Peek("Foo")); got != "testfoo" {
+			t.Fatalf("unexpected trailer header %q. Expecting %q", got, "testfoo")
+		}
+	}
+}
+
+func TestResponseBufferedBodyWithTrailer(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{"", "data"} {
+		var resp1 Response
+		resp1.SetBodyString(body)
+		if err := resp1.Header.AddTrailer("Foo"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		resp1.Header.Set("Foo", "testfoo")
+
+		w := &bytes.Buffer{}
+		bw := bufio.NewWriter(w)
+		if err := resp1.Write(bw); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		wire := w.String()
+		if !strings.Contains(wire, "Transfer-Encoding: chunked\r\n") {
+			t.Fatalf("expected chunked transfer encoding, got:\n%q", wire)
+		}
+		if strings.Contains(wire, "Content-Length:") {
+			t.Fatalf("expected no content length, got:\n%q", wire)
+		}
+		if !strings.Contains(wire, "Trailer: Foo\r\n") {
+			t.Fatalf("expected the Trailer header, got:\n%q", wire)
+		}
+		if !strings.HasSuffix(wire, "0\r\nFoo: testfoo\r\n\r\n") {
+			t.Fatalf("expected the trailer after the last chunk, got:\n%q", wire)
+		}
+
+		var resp2 Response
+		if err := resp2.Read(bufio.NewReader(w)); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if string(resp2.Body()) != body {
+			t.Fatalf("unexpected body: %q. Expecting %q", resp2.Body(), body)
+		}
+		if got := string(resp2.Header.Peek("Foo")); got != "testfoo" {
+			t.Fatalf("unexpected trailer header %q. Expecting %q", got, "testfoo")
+		}
+	}
+}
+
+func TestRequestBufferedBodyWithTrailerContentType(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		body        string
+		contentType string
+		noDefault   bool
+		expected    string
+	}{
+		// Switching to chunked encoding must keep the default
+		// Content-Type that a Content-Length framed body gets.
+		{name: "default", body: "data", expected: "application/octet-stream"},
+		{name: "explicit", body: "data", contentType: "text/plain", expected: "text/plain"},
+		{name: "no default", body: "data", noDefault: true, expected: ""},
+		{name: "empty body", body: "", expected: ""},
+	} {
+		var req1 Request
+		req1.Header.SetMethod(MethodPost)
+		req1.SetRequestURI("http://example.com/upload")
+		req1.SetBodyString(tc.body)
+		if tc.contentType != "" {
+			req1.Header.SetContentType(tc.contentType)
+		}
+		req1.Header.SetNoDefaultContentType(tc.noDefault)
+		if err := req1.Header.AddTrailer("Foo"); err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.name, err)
+		}
+		req1.Header.Set("Foo", "testfoo")
+
+		w := &bytes.Buffer{}
+		bw := bufio.NewWriter(w)
+		if err := req1.Write(bw); err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.name, err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.name, err)
+		}
+
+		wire := w.String()
+		if !strings.Contains(wire, "Transfer-Encoding: chunked\r\n") {
+			t.Fatalf("%s: expected chunked transfer encoding, got:\n%q", tc.name, wire)
+		}
+		if tc.expected == "" {
+			if strings.Contains(wire, "Content-Type:") {
+				t.Fatalf("%s: expected no content type, got:\n%q", tc.name, wire)
+			}
+			continue
+		}
+		if !strings.Contains(wire, "Content-Type: "+tc.expected+"\r\n") {
+			t.Fatalf("%s: expected content type %q, got:\n%q", tc.name, tc.expected, wire)
+		}
+
+		var req2 Request
+		if err := req2.Read(bufio.NewReader(w)); err != nil {
+			t.Fatalf("%s: unexpected error: %v", tc.name, err)
+		}
+		if got := string(req2.Header.ContentType()); got != tc.expected {
+			t.Fatalf("%s: unexpected content type %q. Expecting %q", tc.name, got, tc.expected)
+		}
+	}
+}
+
+func TestResponseBufferedBodyWithTrailerSkipBody(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	resp.SkipBody = true
+	resp.SetBodyString("data")
+	if err := resp.Header.AddTrailer("Foo"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Header.Set("Foo", "testfoo")
+
+	w := &bytes.Buffer{}
+	bw := bufio.NewWriter(w)
+	if err := resp.Write(bw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wire := w.String()
+	if strings.Contains(wire, "Transfer-Encoding: chunked\r\n") {
+		t.Fatalf("expected no chunked transfer encoding without a sent body, got:\n%q", wire)
+	}
+	if !strings.HasSuffix(wire, "\r\n\r\n") || strings.HasSuffix(wire, "Foo: testfoo\r\n\r\n") {
+		t.Fatalf("expected no body and no trailer values on the wire, got:\n%q", wire)
+	}
+}
+
+func TestRequestBufferedBodyWithTrailerHTTP10(t *testing.T) {
+	t.Parallel()
+
+	var req1 Request
+	req1.Header.SetMethod(MethodPost)
+	req1.Header.SetProtocol("HTTP/1.0")
+	req1.SetRequestURI("http://example.com/upload")
+	req1.SetBodyString("data")
+	if err := req1.Header.AddTrailer("Foo"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	req1.Header.Set("Foo", "testfoo")
+
+	w := &bytes.Buffer{}
+	bw := bufio.NewWriter(w)
+	if err := req1.Write(bw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// HTTP/1.0 doesn't support chunked encoding, so the body keeps
+	// Content-Length framing.
+	wire := w.String()
+	if !strings.HasPrefix(wire, "POST /upload HTTP/1.0\r\n") {
+		t.Fatalf("unexpected request line, got:\n%q", wire)
+	}
+	if strings.Contains(wire, "Transfer-Encoding:") {
+		t.Fatalf("expected no transfer encoding for HTTP/1.0, got:\n%q", wire)
+	}
+	if !strings.Contains(wire, "Content-Length: 4\r\n") {
+		t.Fatalf("expected content length, got:\n%q", wire)
+	}
+	if !strings.HasSuffix(wire, "\r\n\r\ndata") {
+		t.Fatalf("expected a plain body, got:\n%q", wire)
+	}
+
+	var req2 Request
+	if err := req2.Read(bufio.NewReader(w)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(req2.Body()) != "data" {
+		t.Fatalf("unexpected body: %q. Expecting %q", req2.Body(), "data")
+	}
+}
+
+func TestResponseBufferedBodyWithTrailerHTTP10(t *testing.T) {
+	t.Parallel()
+
+	// Only parsing marks a ResponseHeader as HTTP/1.0, so start from a
+	// parsed HTTP/1.0 response, like a proxy forwarding an upstream response.
+	var resp1 Response
+	br := bufio.NewReader(strings.NewReader("HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\ndata"))
+	if err := resp1.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp1.Header.IsHTTP11() {
+		t.Fatal("expected an HTTP/1.0 response header")
+	}
+	if err := resp1.Header.AddTrailer("Foo"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp1.Header.Set("Foo", "testfoo")
+
+	w := &bytes.Buffer{}
+	bw := bufio.NewWriter(w)
+	if err := resp1.Write(bw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wire := w.String()
+	if !strings.HasPrefix(wire, "HTTP/1.0 200 OK\r\n") {
+		t.Fatalf("unexpected status line, got:\n%q", wire)
+	}
+	if strings.Contains(wire, "Transfer-Encoding:") {
+		t.Fatalf("expected no transfer encoding for HTTP/1.0, got:\n%q", wire)
+	}
+	if !strings.Contains(wire, "Content-Length: 4\r\n") {
+		t.Fatalf("expected content length, got:\n%q", wire)
+	}
+	if !strings.HasSuffix(wire, "\r\n\r\ndata") {
+		t.Fatalf("expected a plain body, got:\n%q", wire)
+	}
+
+	var resp2 Response
+	if err := resp2.Read(bufio.NewReader(w)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(resp2.Body()) != "data" {
+		t.Fatalf("unexpected body: %q. Expecting %q", resp2.Body(), "data")
+	}
+}
+
+// writeCounter counts the writes reaching the underlying writer, which is
+// how often a bufio.Writer wrapping it was flushed.
+type writeCounter struct {
+	n int
+}
+
+func (wc *writeCounter) Write(p []byte) (int, error) {
+	wc.n++
+	return len(p), nil
+}
+
+func TestRequestBufferedBodyWithTrailerNoFlush(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://example.com/upload")
+	req.SetBodyString("data")
+	if err := req.Header.AddTrailer("Foo"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	req.Header.Set("Foo", "testfoo")
+
+	var wc writeCounter
+	bw := bufio.NewWriter(&wc)
+	if err := req.Write(bw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.n != 0 {
+		t.Fatalf("Write flushed %d times, expecting none", wc.n)
+	}
+	if bw.Buffered() == 0 {
+		t.Fatal("expected the request to be buffered")
+	}
+}
+
+func TestResponseBufferedBodyWithTrailerNoFlush(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	resp.SetBodyString("data")
+	if err := resp.Header.AddTrailer("Foo"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	resp.Header.Set("Foo", "testfoo")
+
+	var wc writeCounter
+	bw := bufio.NewWriter(&wc)
+	if err := resp.Write(bw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wc.n != 0 {
+		t.Fatalf("Write flushed %d times, expecting none", wc.n)
+	}
+	if bw.Buffered() == 0 {
+		t.Fatal("expected the response to be buffered")
+	}
+}
+
+// The last chunk stays buffered with the trailer section that follows it,
+// through both the Read and the WriteTo framing paths.
+func TestResponseBodyStreamLastChunkNoFlush(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []io.Reader{strings.NewReader("data"), bytes.NewReader([]byte("data"))} {
+		var resp Response
+		resp.SetBodyStream(body, -1)
+
+		var wc writeCounter
+		bw := bufio.NewWriter(&wc)
+		if err := resp.Write(bw); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if wc.n != 1 {
+			t.Fatalf("%T: Write flushed %d times, expecting only the data chunk", body, wc.n)
+		}
+		if got := bw.Buffered(); got != len("0\r\n\r\n") {
+			t.Fatalf("%T: %d bytes left buffered, expecting the last chunk and the trailer section", body, got)
 		}
 	}
 }
@@ -448,6 +996,47 @@ func TestResponseBodyUncompressed(t *testing.T) {
 	}
 }
 
+func TestBodyUncompressedContentEncodingCase(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("body")
+	testCases := []struct {
+		encoding string
+		encoded  []byte
+	}{
+		{encoding: "GZIP", encoded: AppendGzipBytes(nil, body)},
+		{encoding: "Deflate", encoded: AppendDeflateBytes(nil, body)},
+		{encoding: "BR", encoded: AppendBrotliBytes(nil, body)},
+		{encoding: "Zstd", encoded: AppendZstdBytes(nil, body)},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.encoding, func(t *testing.T) {
+			var req Request
+			req.Header.SetContentEncoding(tc.encoding)
+			req.SetBodyRaw(tc.encoded)
+			b, err := req.BodyUncompressed()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !bytes.Equal(b, body) {
+				t.Fatalf("unexpected body: %q. Expecting %q", b, body)
+			}
+
+			var resp Response
+			resp.Header.SetContentEncoding(tc.encoding)
+			resp.SetBodyRaw(tc.encoded)
+			b, err = resp.BodyUncompressed()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !bytes.Equal(b, body) {
+				t.Fatalf("unexpected body: %q. Expecting %q", b, body)
+			}
+		})
+	}
+}
+
 func TestBodyDecodeWithLimitTooLarge(t *testing.T) {
 	t.Parallel()
 
@@ -490,7 +1079,7 @@ func TestBodyDecodeWithLimitTooLarge(t *testing.T) {
 	}
 
 	for _, testCase := range testCases {
-		t.Run(testCase.name+"_request_uncompressed", func(t *testing.T) {
+		t.Run(testCase.name+"/request uncompressed", func(t *testing.T) {
 			var req Request
 			req.Header.SetContentEncoding(testCase.encoding)
 			req.SetBodyRaw(testCase.encode(body))
@@ -500,7 +1089,7 @@ func TestBodyDecodeWithLimitTooLarge(t *testing.T) {
 			}
 		})
 
-		t.Run(testCase.name+"_response_uncompressed", func(t *testing.T) {
+		t.Run(testCase.name+"/response uncompressed", func(t *testing.T) {
 			var resp Response
 			resp.Header.SetContentEncoding(testCase.encoding)
 			resp.SetBodyRaw(testCase.encode(body))
@@ -527,7 +1116,7 @@ func TestRequestMultipartFormWithLimitGzip(t *testing.T) {
 	formBody := formBodyBuffer.Bytes()
 	gzippedBody := AppendGzipBytes(nil, formBody)
 
-	t.Run("buffered_too_large", func(t *testing.T) {
+	t.Run("buffered too large", func(t *testing.T) {
 		var req Request
 		req.Header.SetMultipartFormBoundary(boundary)
 		req.Header.SetContentEncoding("gzip")
@@ -539,7 +1128,7 @@ func TestRequestMultipartFormWithLimitGzip(t *testing.T) {
 		}
 	})
 
-	t.Run("streamed_too_large", func(t *testing.T) {
+	t.Run("streamed too large", func(t *testing.T) {
 		var req Request
 		req.Header.SetMultipartFormBoundary(boundary)
 		req.Header.SetContentEncoding("gzip")
@@ -551,7 +1140,7 @@ func TestRequestMultipartFormWithLimitGzip(t *testing.T) {
 		}
 	})
 
-	t.Run("buffered_success", func(t *testing.T) {
+	t.Run("buffered success", func(t *testing.T) {
 		var req Request
 		req.Header.SetMultipartFormBoundary(boundary)
 		req.Header.SetContentEncoding("gzip")
@@ -569,6 +1158,40 @@ func TestRequestMultipartFormWithLimitGzip(t *testing.T) {
 		}
 		if vv[0] != strings.Repeat("a", 8*1024) {
 			t.Fatalf("unexpected value length: %d", len(vv[0]))
+		}
+	})
+
+	t.Run("uppercase content-encoding", func(t *testing.T) {
+		var req Request
+		req.Header.SetMultipartFormBoundary(boundary)
+		req.Header.SetContentEncoding("GZIP")
+		req.SetBodyRaw(gzippedBody)
+
+		f, err := req.MultipartFormWithLimit(len(formBody))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		defer req.RemoveMultipartFormFiles()
+
+		if vv := f.Value["foo"]; len(vv) != 1 || vv[0] != strings.Repeat("a", 8*1024) {
+			t.Fatalf("unexpected values: %d", len(vv))
+		}
+	})
+
+	t.Run("streamed uppercase content-encoding", func(t *testing.T) {
+		var req Request
+		req.Header.SetMultipartFormBoundary(boundary)
+		req.Header.SetContentEncoding("GZIP")
+		req.SetBodyStream(bytes.NewReader(gzippedBody), len(gzippedBody))
+
+		f, err := req.MultipartFormWithLimit(len(formBody))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		defer req.RemoveMultipartFormFiles()
+
+		if vv := f.Value["foo"]; len(vv) != 1 || vv[0] != strings.Repeat("a", 8*1024) {
+			t.Fatalf("unexpected values: %d", len(vv))
 		}
 	})
 }
@@ -593,7 +1216,7 @@ func TestResponseSwapBodyConcurrent(t *testing.T) {
 	for range 10 {
 		select {
 		case <-ch:
-		case <-time.After(time.Second):
+		case <-time.After(testTimeout(time.Second)):
 			t.Fatalf("timeout")
 		}
 	}
@@ -647,7 +1270,7 @@ func TestRequestSwapBodyConcurrent(t *testing.T) {
 	for range 10 {
 		select {
 		case <-ch:
-		case <-time.After(time.Second):
+		case <-time.After(testTimeout(time.Second)):
 			t.Fatalf("timeout")
 		}
 	}
@@ -1230,6 +1853,31 @@ func TestRequestWriteTo(t *testing.T) {
 	}
 }
 
+// A response without a body has no trailer section either.
+func TestResponseWriteSkipBodyOmitsTrailer(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	resp.SkipBody = true
+	if err := resp.Header.AddTrailer("X-Sum"); err != nil {
+		t.Fatal(err)
+	}
+	resp.Header.Set("X-Sum", "1")
+	resp.SetBodyStream(strings.NewReader("abc"), -1)
+
+	var buf bytes.Buffer
+	bw := bufio.NewWriter(&buf)
+	if err := resp.Write(bw); err != nil {
+		t.Fatal(err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if wire := buf.String(); !strings.HasSuffix(wire, "Trailer: X-Sum\r\n\r\n") || strings.Contains(wire, "X-Sum: 1") {
+		t.Fatalf("wire = %q, want the headers alone", wire)
+	}
+}
+
 func TestResponseSkipBody(t *testing.T) {
 	t.Parallel()
 
@@ -1473,6 +2121,18 @@ func TestRequestMayContinue(t *testing.T) {
 	if !r.MayContinue() {
 		t.Fatalf("MayContinue on 'Expect: 100-continue' header must return true")
 	}
+
+	// The Expect field value is case-insensitive (RFC 9110, section 10.1.1).
+	r.Header.Set("Expect", "100-Continue")
+	if !r.MayContinue() {
+		t.Fatalf("MayContinue on 'Expect: 100-Continue' header must return true")
+	}
+
+	// The expectation is ignored in HTTP/1.0 requests (RFC 9110, section 10.1.1).
+	r.Header.SetProtocol("HTTP/1.0")
+	if r.MayContinue() {
+		t.Fatalf("MayContinue on an HTTP/1.0 request must return false")
+	}
 }
 
 func TestResponseGzipStream(t *testing.T) {
@@ -1693,6 +2353,152 @@ func TestRequestMultipartForm(t *testing.T) {
 	testRequestMultipartForm(t, "foobar", req.Body(), 3)
 }
 
+func TestRequestMultipartFormMediaTypeCase(t *testing.T) {
+	t.Parallel()
+
+	body := "--foobar\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nvalue\r\n--foobar--\r\n"
+
+	for _, contentType := range []string{
+		"Multipart/Form-Data; boundary=foobar",
+		"multipart/form-data; Boundary=foobar",
+		"MULTIPART/FORM-DATA; BOUNDARY=foobar",
+	} {
+		t.Run(contentType, func(t *testing.T) {
+			s := fmt.Sprintf("POST / HTTP/1.1\r\nHost: aaa\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n%s",
+				contentType, len(body), body)
+
+			for _, preParse := range []bool{true, false} {
+				var req Request
+				br := bufio.NewReader(strings.NewReader(s))
+				if err := req.Header.Read(br); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if err := req.ContinueReadBody(br, 0, preParse); err != nil {
+					t.Fatalf("preParse=%v: unexpected error: %v", preParse, err)
+				}
+				f, err := req.MultipartForm()
+				if err != nil {
+					t.Fatalf("preParse=%v: unexpected error: %v", preParse, err)
+				}
+				if vv := f.Value["key"]; len(vv) != 1 || vv[0] != "value" {
+					t.Fatalf("preParse=%v: unexpected values %q", preParse, vv)
+				}
+				req.RemoveMultipartFormFiles()
+			}
+
+			if !isMultipartFormData([]byte(contentType)) {
+				t.Fatalf("isMultipartFormData(%q) = false; want true", contentType)
+			}
+		})
+	}
+}
+
+func TestRequestMultipartFormOptionalWhitespace(t *testing.T) {
+	t.Parallel()
+
+	body := "--foobar\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nvalue\r\n--foobar--\r\n"
+
+	for _, contentType := range []string{
+		"multipart/form-data ; boundary=foobar",
+		"multipart/form-data;\tboundary=foobar",
+		"multipart/form-data; boundary=foobar ; charset=utf-8",
+	} {
+		t.Run(contentType, func(t *testing.T) {
+			for _, stream := range []bool{false, true} {
+				var req Request
+				req.Header.SetContentType(contentType)
+				if stream {
+					req.SetBodyStream(strings.NewReader(body), len(body))
+				} else {
+					req.SetBodyString(body)
+				}
+				f, err := req.MultipartForm()
+				if err != nil {
+					t.Fatalf("stream=%v: unexpected error: %v", stream, err)
+				}
+				if vv := f.Value["key"]; len(vv) != 1 || vv[0] != "value" {
+					t.Fatalf("stream=%v: unexpected values %q", stream, vv)
+				}
+				req.RemoveMultipartFormFiles()
+			}
+
+			if !isMultipartFormData([]byte(contentType)) {
+				t.Fatalf("isMultipartFormData(%q) = false; want true", contentType)
+			}
+		})
+	}
+}
+
+func TestRequestMultipartFormEpilogue(t *testing.T) {
+	t.Parallel()
+
+	// Bytes the sender put between the closing boundary and Content-Length.
+	// They belong to this request's body, so they must not show up as the
+	// next request on the connection.
+	body := "--foobar\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nvalue\r\n--foobar--\r\n" +
+		strings.Repeat("z", 8*1024)
+	next := "GET /next HTTP/1.1\r\nHost: aaa\r\n\r\n"
+
+	s := fmt.Sprintf("POST /first HTTP/1.1\r\nHost: aaa\r\nContent-Type: multipart/form-data; boundary=foobar\r\nContent-Length: %d\r\n\r\n%s%s",
+		len(body), body, next)
+
+	br := bufio.NewReader(bytes.NewBufferString(s))
+
+	var req Request
+	if err := req.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	req.RemoveMultipartFormFiles()
+
+	var req2 Request
+	if err := req2.Read(br); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(req2.URI().Path()) != "/next" {
+		t.Fatalf("unexpected path %q; expecting %q", req2.URI().Path(), "/next")
+	}
+}
+
+// uncomparableReader is passed by value and holds a slice, so its dynamic type
+// is not comparable and `reader == reader` panics at runtime.
+type uncomparableReader struct {
+	data []byte
+	off  *int
+}
+
+func (r uncomparableReader) Read(p []byte) (int, error) {
+	if *r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[*r.off:])
+	*r.off += n
+	return n, nil
+}
+
+func TestRequestMultipartFormUncomparableBodyStream(t *testing.T) {
+	t.Parallel()
+
+	// SetBodyStream accepts any io.Reader, so the drain must not compare the
+	// stream against another reader value: an uncomparable dynamic type would
+	// panic with "comparing uncomparable type".
+	body := "--foobar\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nvalue\r\n--foobar--\r\n"
+
+	var req Request
+	req.Header.SetContentType("multipart/form-data; boundary=foobar")
+	req.Header.SetContentLength(len(body))
+	req.SetBodyStream(uncomparableReader{data: []byte(body), off: new(int)}, len(body))
+
+	form, err := req.MultipartForm()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer req.RemoveMultipartFormFiles()
+
+	if v := form.Value["key"]; len(v) != 1 || v[0] != "value" {
+		t.Fatalf("unexpected form value %q; expecting %q", form.Value["key"], []string{"value"})
+	}
+}
+
 func testRequestMultipartForm(t *testing.T, boundary string, formData []byte, partsCount int) []byte {
 	s := fmt.Sprintf("POST / HTTP/1.1\r\nHost: aaa\r\nContent-Type: multipart/form-data; boundary=%s\r\nContent-Length: %d\r\n\r\n%s",
 		boundary, len(formData), formData)
@@ -1777,25 +2583,56 @@ func TestRequestReadLimitBody(t *testing.T) {
 	testRequestReadLimitBodySuccess(t, "GET /foo HTTP/1.0\r\n\r\n", 0)
 }
 
-func TestRequestReadLimitBodyWhitespaceBeforeColonFramingHeaders(t *testing.T) {
+func TestRequestReadLimitBodyContentLengthAndTransferEncoding(t *testing.T) {
 	t.Parallel()
 
-	var req Request
-	r := bytes.NewBufferString("POST /foo HTTP/1.1\r\nHost: a.com\r\nContent-Length : 4\r\n\r\ntestNEXT")
-	br := bufio.NewReader(r)
-	if err := req.ReadLimitBody(br, 10); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if got := string(req.Body()); got != "test" {
-		t.Fatalf("unexpected body %q", got)
+	tests := []string{
+		"POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT",
+		"POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n4\r\ntest\r\n0\r\n\r\nNEXT",
 	}
 
-	rest, err := io.ReadAll(br)
-	if err != nil {
-		t.Fatalf("unexpected read error: %v", err)
+	for _, s := range tests {
+		var req Request
+		br := bufio.NewReader(bytes.NewBufferString(s))
+		if err := req.ReadLimitBody(br, 0); err != nil {
+			t.Fatalf("unexpected error: %v. s=%q", err, s)
+		}
+		if body := string(req.Body()); body != "test" {
+			t.Fatalf("unexpected body %q. Expecting %q. s=%q", body, "test", s)
+		}
+		if !req.Header.ConnectionClose() {
+			t.Fatalf("expecting connection close. s=%q", s)
+		}
+		b, err := br.Peek(4)
+		if err != nil {
+			t.Fatalf("unexpected error reading remaining bytes: %v. s=%q", err, s)
+		}
+		if string(b) != "NEXT" {
+			t.Fatalf("unexpected remaining bytes %q. Expecting %q. s=%q", b, "NEXT", s)
+		}
 	}
-	if got := string(rest); got != "NEXT" {
-		t.Fatalf("unexpected buffered bytes %q", got)
+
+	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: 1nope\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 0, ErrNonNumericChars)
+	testRequestReadLimitBodyError(t, "POST /foo HTTP/1.1\r\nHost: aaa.com\r\nTransfer-Encoding: chunked\r\nContent-Length: 1nope\r\n\r\n0\r\n\r\n", 0, ErrNonNumericChars)
+}
+
+func TestRequestReadLimitBodyRejectWhitespaceBeforeColonFramingHeaders(t *testing.T) {
+	t.Parallel()
+
+	tests := []string{
+		"POST /foo HTTP/1.1\r\nHost: a.com\r\nContent-Length : 4\r\n\r\ntestNEXT",
+		"POST /foo HTTP/1.1\r\nHost: a.com\r\nTransfer-Encoding : chunked\r\n\r\n4\r\ntest\r\n0\r\n\r\n",
+	}
+
+	for _, s := range tests {
+		var req Request
+		br := bufio.NewReader(bytes.NewBufferString(s))
+		if err := req.ReadLimitBody(br, 10); err == nil {
+			t.Fatalf("expecting error for %q", s)
+		}
+		if body := req.Body(); len(body) != 0 {
+			t.Fatalf("unexpected body %q for %q", body, s)
+		}
 	}
 }
 
@@ -1921,6 +2758,114 @@ func TestRequestWriteRequestURINoHost(t *testing.T) {
 	}
 }
 
+func TestRequestWriteEmptyPathWithQuery(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	req.SetRequestURI("http://example.com?foo=bar")
+	var w bytes.Buffer
+	bw := bufio.NewWriter(&w)
+	if err := req.Write(bw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	firstLine, _, _ := strings.Cut(w.String(), "\r\n")
+	if firstLine != "GET /?foo=bar HTTP/1.1" {
+		t.Fatalf("unexpected request line %q. Expecting %q", firstLine, "GET /?foo=bar HTTP/1.1")
+	}
+
+	req.Reset()
+	req.SetRequestURI("http://example.com?foo=bar")
+	req.URI().DisablePathNormalizing = true
+	w.Reset()
+	bw.Reset(&w)
+	if err := req.Write(bw); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	firstLine, _, _ = strings.Cut(w.String(), "\r\n")
+	if firstLine != "GET /?foo=bar HTTP/1.1" {
+		t.Fatalf("unexpected request line with DisablePathNormalizing %q. Expecting %q", firstLine, "GET /?foo=bar HTTP/1.1")
+	}
+}
+
+func TestRequestWriteURLAuthKeepsAuthorization(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"":                       "Basic dXNlcjpwYXNz",
+		"Bearer token":           "Bearer token",
+		"Basic b3RoZXI6c2VjcmV0": "Basic b3RoZXI6c2VjcmV0",
+	}
+	for auth, expected := range cases {
+		var req Request
+		req.SetRequestURI("http://user:pass@example.com/foo")
+		if auth != "" {
+			req.Header.Set(HeaderAuthorization, auth)
+		}
+		var w bytes.Buffer
+		bw := bufio.NewWriter(&w)
+		if err := req.Write(bw); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		var req1 Request
+		if err := req1.Read(bufio.NewReader(&w)); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := req1.Header.PeekAll(HeaderAuthorization); len(got) != 1 || string(got[0]) != expected {
+			t.Fatalf("unexpected %q header %q with %q set. Expecting %q", HeaderAuthorization, got, auth, expected)
+		}
+	}
+}
+
+func TestRequestWriteConnectTargetAfterURIAccess(t *testing.T) {
+	t.Parallel()
+
+	for _, target := range []string{"example.com:443", "[::1]:443", "//example.com:443", "/tunnel"} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+
+			var req Request
+			s := "CONNECT " + target + " HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+			if err := req.Read(bufio.NewReader(strings.NewReader(s))); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			// Accessing the URI makes Write rebuild the target from the
+			// parsed URI, which must keep the CONNECT target as it is, also
+			// when path normalization is enabled, as HostClient leaves it.
+			req.URI().DisablePathNormalizing = false
+			if got := string(req.RequestURI()); got != target {
+				t.Fatalf("unexpected request uri %q. Expecting %q", got, target)
+			}
+
+			var w bytes.Buffer
+			bw := bufio.NewWriter(&w)
+			if err := req.Write(bw); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if err := bw.Flush(); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			firstLine, _, _ := strings.Cut(w.String(), "\r\n")
+			if want := "CONNECT " + target + " HTTP/1.1"; firstLine != want {
+				t.Fatalf("unexpected request line %q. Expecting %q", firstLine, want)
+			}
+		})
+	}
+}
+
 func TestSetRequestBodyStreamFixedSize(t *testing.T) {
 	t.Parallel()
 
@@ -1935,6 +2880,50 @@ func TestSetResponseBodyStreamFixedSize(t *testing.T) {
 	testSetResponseBodyStream(t, "a")
 	testSetResponseBodyStream(t, string(createFixedBody(4097)))
 	testSetResponseBodyStream(t, string(createFixedBody(100500)))
+}
+
+func TestResponseSendFileGrownFile(t *testing.T) {
+	t.Parallel()
+
+	for _, size := range []int{100, 2 * maxSmallFileSize} {
+		body := createFixedBody(size)
+		filePath := filepath.Join(t.TempDir(), "file")
+		if err := os.WriteFile(filePath, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var resp Response
+		if err := resp.SendFile(filePath); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// The file grows after SendFile took its size for Content-Length.
+		f, err := os.OpenFile(filePath, os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = f.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"); err != nil {
+			t.Fatal(err)
+		}
+		if err = f.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		var w bytes.Buffer
+		bw := bufio.NewWriter(&w)
+		if err = resp.Write(bw); err != nil {
+			t.Fatalf("unexpected error when writing response: %v. size=%d", err, size)
+		}
+		if err = bw.Flush(); err != nil {
+			t.Fatalf("unexpected error when flushing response: %v. size=%d", err, size)
+		}
+
+		_, written, _ := bytes.Cut(w.Bytes(), []byte("\r\n\r\n"))
+		if resp.Header.ContentLength() != size || !bytes.Equal(written, body) {
+			t.Fatalf("wrote a body of %d bytes with Content-Length %d. Expecting %d bytes",
+				len(written), resp.Header.ContentLength(), size)
+		}
+	}
 }
 
 func TestSetRequestBodyStreamChunked(t *testing.T) {
@@ -2165,11 +3154,73 @@ func TestRequestChunkedWhitespace(t *testing.T) {
 	rb := bufio.NewReader(r)
 	err := req.Read(rb)
 	if err != nil {
-		t.Fatalf("Unexpected error when reading chunked request: %v", err)
+		t.Fatalf("unexpected error when reading chunked request: %v", err)
 	}
 	expectedBody := "abc"
 	if string(req.Body()) != expectedBody {
-		t.Fatalf("Unexpected body %q. Expected %q", req.Body(), expectedBody)
+		t.Fatalf("unexpected body %q. Expected %q", req.Body(), expectedBody)
+	}
+}
+
+func TestParseChunkSize(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		line string
+		size int
+	}{
+		{
+			name: "without extension",
+			line: "3\r\n",
+			size: 3,
+		},
+		{
+			name: "with extension",
+			line: "3;ext\r\n",
+			size: 3,
+		},
+		{
+			name: "trailing space",
+			line: "3 \r\n",
+			size: 3,
+		},
+		{
+			name: "trailing tab",
+			line: "3\t\r\n",
+			size: 3,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			rb := bufio.NewReader(bytes.NewBufferString(test.line))
+			size, err := parseChunkSize(rb)
+			if err != nil {
+				t.Fatalf("unexpected error when reading chunk size %q: %v", test.line, err)
+			}
+			if size != test.size {
+				t.Fatalf("unexpected chunk size %d. Expected %d", size, test.size)
+			}
+		})
+	}
+}
+
+func TestParseChunkSizeWhitespaceError(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []string{
+		"3 ;ext\r\n",
+		"3\t;ext\r\n",
+	} {
+		t.Run(fmt.Sprintf("%q", test), func(t *testing.T) {
+			t.Parallel()
+
+			rb := bufio.NewReader(bytes.NewBufferString(test))
+			if _, err := parseChunkSize(rb); err == nil {
+				t.Fatalf("expecting error when reading chunk size %q", test)
+			}
+		})
 	}
 }
 
@@ -2184,8 +3235,8 @@ func TestResponseReadWithoutBody(t *testing.T) {
 	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 204 Foo Bar\r\nContent-Type: aab\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", false,
 		204, -1, "aab")
 
-	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 123 AAA\r\nContent-Type: xxx\r\nContent-Length: 3434\r\n\r\n", false,
-		123, 3434, "xxx")
+	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 123 AAA\r\nContent-Type: xxx\r\n\r\nHTTP/1.1 250 BBB\r\nContent-Type: yyy\r\nContent-Length: 0\r\n\r\n", false,
+		250, 0, "yyy")
 
 	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: 123\r\n\r\nfoobar\r\n", true,
 		200, 123, "text/xml")
@@ -2193,6 +3244,44 @@ func TestResponseReadWithoutBody(t *testing.T) {
 	// '100 Continue' must be skipped.
 	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 100 Continue\r\nFoo-bar: baz\r\n\r\nHTTP/1.1 329 aaa\r\nContent-Type: qwe\r\nContent-Length: 894\r\n\r\n", true,
 		329, 894, "qwe")
+}
+
+func TestResponseReadSwitchingProtocolsIsTerminal(t *testing.T) {
+	t.Parallel()
+
+	r := bufio.NewReader(strings.NewReader(
+		"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nUPGRADE-DATA",
+	))
+	var resp Response
+	if err := resp.Read(r); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.StatusCode() != StatusSwitchingProtocols {
+		t.Fatalf("unexpected status code %d; want %d", resp.StatusCode(), StatusSwitchingProtocols)
+	}
+	remaining, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read upgrade data: %v", err)
+	}
+	if string(remaining) != "UPGRADE-DATA" {
+		t.Fatalf("unexpected upgrade data %q", remaining)
+	}
+}
+
+func TestResponseReadLimitsInterimResponses(t *testing.T) {
+	t.Parallel()
+
+	var s strings.Builder
+	for range maxInterimResponses + 1 {
+		s.WriteString("HTTP/1.1 103 Early Hints\r\n\r\n")
+	}
+	s.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+	var resp Response
+	err := resp.Read(bufio.NewReader(strings.NewReader(s.String())))
+	if !errors.Is(err, errTooManyInterimResponses) {
+		t.Fatalf("unexpected error %v; want %v", err, errTooManyInterimResponses)
+	}
 }
 
 func testResponseReadWithoutBody(t *testing.T, resp *Response, s string, skipBody bool,
@@ -2424,10 +3513,6 @@ func TestResponseReadSuccess(t *testing.T) {
 	testResponseReadSuccess(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nqwer\r\n2\r\nty\r\n0\r\nFoo2: bar2\r\n\r\n",
 		200, -1, "text/html", "qwerty", map[string]string{"Foo2": "bar2"})
 
-	// chunked response with non-chunked Transfer-Encoding.
-	testResponseReadSuccess(t, resp, "HTTP/1.1 230 OK\r\nContent-Type: text\r\nTransfer-Encoding: aaabbb\r\n\r\n2\r\ner\r\n2\r\nty\r\n0\r\nFoo3: bar3\r\n\r\n",
-		230, -1, "text", "erty", map[string]string{"Foo3": "bar3"})
-
 	// chunked response with content-length
 	testResponseReadSuccess(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: foo/bar\r\nContent-Length: 123\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ntest\r\n0\r\nFoo4:bar4\r\n\r\n",
 		200, -1, "foo/bar", "test", map[string]string{"Foo4": "bar4"})
@@ -2439,6 +3524,42 @@ func TestResponseReadSuccess(t *testing.T) {
 	// chunked response with chunk extension
 	testResponseReadSuccess(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n3;ext\r\naaa\r\n0\r\nFoo6: bar6\r\n\r\n",
 		200, -1, "text/html", "aaa", map[string]string{"Foo6": "bar6"})
+}
+
+func TestResponseReadUnsupportedTransferEncoding(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		response string
+	}{
+		{
+			name:     "deflate",
+			response: "HTTP/1.1 200 OK\r\nTransfer-Encoding: deflate\r\nContent-Length: 5\r\n\r\nABCDE",
+		},
+		{
+			name:     "identity",
+			response: "HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\nContent-Length: 5\r\n\r\nABCDE",
+		},
+		{
+			name:     "compound",
+			response: "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",
+		},
+		{
+			name:     "duplicate",
+			response: "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resp Response
+			if err := resp.Read(bufio.NewReader(strings.NewReader(tt.response))); err == nil {
+				t.Fatal("expected an error")
+			}
+			expectNetHTTPReadResponseError(t, tt.response, "net/http accepted response")
+		})
+	}
 }
 
 func TestResponseReadError(t *testing.T) {
@@ -2462,6 +3583,8 @@ func TestResponseReadError(t *testing.T) {
 	testResponseReadError(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: aaa\r\nTransfer-Encoding: chunked\r\n\r\nfoo")
 
 	testResponseReadError(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: aaa\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nfoo")
+
+	testResponseReadError(t, resp, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: nope\r\n\r\n0\r\n\r\n")
 }
 
 func testResponseReadError(t *testing.T, resp *Response, response string) {
@@ -2595,6 +3718,9 @@ func TestRequestPostArgsSuccess(t *testing.T) {
 	testRequestPostArgsSuccess(t, &req, "POST / HTTP/1.1\r\nHost: aaa.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n\r\n", 0, "foo=", "=")
 
 	testRequestPostArgsSuccess(t, &req, "POST / HTTP/1.1\r\nHost: aaa.com\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 18\r\n\r\nfoo&b%20r=b+z=&qwe", 3, "foo=", "b r=b z=", "qwe=")
+
+	// media type is case-insensitive
+	testRequestPostArgsSuccess(t, &req, "POST / HTTP/1.1\r\nHost: aaa.com\r\nContent-Type: Application/X-WWW-Form-Urlencoded\r\nContent-Length: 7\r\n\r\nfoo=bar", 1, "foo=bar")
 }
 
 func TestRequestPostArgsError(t *testing.T) {
@@ -2786,6 +3912,939 @@ func TestRequestRawBodyReset(t *testing.T) {
 	testBodyWriteTo(t, &r, "", true)
 }
 
+func TestResponseKeepBodyBuffer(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	if resp.KeepBodyBuffer {
+		t.Fatalf("expected KeepBodyBuffer to be false by default")
+	}
+	resp.SetBodyString("foobar")
+	if resp.body == nil {
+		t.Fatalf("expected non-nil resp.body")
+	}
+	resp.ResetBody()
+	if resp.body != nil {
+		t.Fatalf("expected nil resp.body after ResetBody when KeepBodyBuffer is false")
+	}
+
+	resp.KeepBodyBuffer = true
+	resp.SetBodyString("foobar-large-buffer-content")
+	buf := resp.body
+	if buf == nil {
+		t.Fatalf("expected non-nil resp.body")
+	}
+	initialCap := cap(buf.B)
+
+	resp.ResetBody()
+	if resp.body == nil {
+		t.Fatalf("expected non-nil resp.body after ResetBody with KeepBodyBuffer=true")
+	}
+	if len(resp.Body()) != 0 {
+		t.Fatalf("expected empty body after ResetBody, got %q", resp.Body())
+	}
+	if cap(resp.body.B) != initialCap {
+		t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(resp.body.B))
+	}
+
+	resp.SetBodyString("new-content")
+	resp.Reset()
+	if resp.body == nil {
+		t.Fatalf("expected non-nil resp.body after Reset with KeepBodyBuffer=true")
+	}
+	if len(resp.Body()) != 0 {
+		t.Fatalf("expected empty body after Reset, got %q", resp.Body())
+	}
+	if cap(resp.body.B) != initialCap {
+		t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(resp.body.B))
+	}
+}
+
+func TestRequestKeepBodyBuffer(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	if req.KeepBodyBuffer {
+		t.Fatalf("expected KeepBodyBuffer to be false by default")
+	}
+	req.SetBodyString("foobar")
+	if req.body == nil {
+		t.Fatalf("expected non-nil req.body")
+	}
+	req.ResetBody()
+	if req.body != nil {
+		t.Fatalf("expected nil req.body after ResetBody when KeepBodyBuffer is false")
+	}
+
+	req.KeepBodyBuffer = true
+	req.SetBodyString("foobar-large-buffer-content")
+	buf := req.body
+	if buf == nil {
+		t.Fatalf("expected non-nil req.body")
+	}
+	initialCap := cap(buf.B)
+
+	req.ResetBody()
+	if req.body == nil {
+		t.Fatalf("expected non-nil req.body after ResetBody with KeepBodyBuffer=true")
+	}
+	if len(req.Body()) != 0 {
+		t.Fatalf("expected empty body after ResetBody, got %q", req.Body())
+	}
+	if cap(req.body.B) != initialCap {
+		t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+	}
+
+	req.SetBodyString("new-content")
+	req.Reset()
+	if req.body == nil {
+		t.Fatalf("expected non-nil req.body after Reset with KeepBodyBuffer=true")
+	}
+	if len(req.Body()) != 0 {
+		t.Fatalf("expected empty body after Reset, got %q", req.Body())
+	}
+	if cap(req.body.B) != initialCap {
+		t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+	}
+}
+
+func TestKeepBodyBufferCopyTo(t *testing.T) {
+	t.Parallel()
+
+	// Destination KeepBodyBuffer should remain unchanged after CopyTo
+	var req1, req2 Request
+	req1.KeepBodyBuffer = false
+	req2.KeepBodyBuffer = true
+	req1.CopyTo(&req2)
+	if !req2.KeepBodyBuffer {
+		t.Fatalf("expected req2.KeepBodyBuffer to remain true when copying from req with KeepBodyBuffer=false")
+	}
+
+	req1.KeepBodyBuffer = true
+	req2.KeepBodyBuffer = false
+	req1.CopyTo(&req2)
+	if req2.KeepBodyBuffer {
+		t.Fatalf("expected req2.KeepBodyBuffer to remain false when copying from req with KeepBodyBuffer=true")
+	}
+
+	var resp1, resp2 Response
+	resp1.KeepBodyBuffer = false
+	resp2.KeepBodyBuffer = true
+	resp1.CopyTo(&resp2)
+	if !resp2.KeepBodyBuffer {
+		t.Fatalf("expected resp2.KeepBodyBuffer to remain true when copying from resp with KeepBodyBuffer=false")
+	}
+
+	resp1.KeepBodyBuffer = true
+	resp2.KeepBodyBuffer = false
+	resp1.CopyTo(&resp2)
+	if resp2.KeepBodyBuffer {
+		t.Fatalf("expected resp2.KeepBodyBuffer to remain false when copying from resp with KeepBodyBuffer=true")
+	}
+}
+
+func TestKeepBodyBufferWithPoolSizeLimit(t *testing.T) {
+	oldRequestLimit := atomic.LoadInt64(&requestBodyPoolSizeLimit)
+	oldResponseLimit := atomic.LoadInt64(&responseBodyPoolSizeLimit)
+	SetBodySizePoolLimit(1024, 1024)
+	t.Cleanup(func() {
+		SetBodySizePoolLimit(int(oldRequestLimit), int(oldResponseLimit))
+	})
+
+	payload := bytes.Repeat([]byte("x"), 2048)
+
+	t.Run("Response", func(t *testing.T) {
+		var resp Response
+		resp.KeepBodyBuffer = true
+		resp.SetBody(payload)
+		buf := resp.body
+		if buf == nil || cap(buf.B) <= 1024 {
+			t.Fatalf("expected resp.body capacity > 1024, got %v", buf)
+		}
+
+		resp.Reset()
+		if resp.body == nil {
+			t.Fatalf("expected resp.body to be retained after Reset when KeepBodyBuffer=true")
+		}
+		if resp.body != buf {
+			t.Fatalf("expected same resp.body buffer instance after Reset")
+		}
+		if cap(resp.body.B) <= 1024 {
+			t.Fatalf("expected capacity to be preserved, got %d", cap(resp.body.B))
+		}
+
+		var defaultResp Response
+		defaultResp.SetBody(payload)
+		defaultResp.Reset()
+		if defaultResp.body != nil {
+			t.Fatalf("expected defaultResp.body to be nil after Reset when KeepBodyBuffer=false and limit exceeded")
+		}
+	})
+
+	t.Run("Request", func(t *testing.T) {
+		var req Request
+		req.KeepBodyBuffer = true
+		req.SetBody(payload)
+		buf := req.body
+		if buf == nil || cap(buf.B) <= 1024 {
+			t.Fatalf("expected req.body capacity > 1024, got %v", buf)
+		}
+
+		req.Reset()
+		if req.body == nil {
+			t.Fatalf("expected req.body to be retained after Reset when KeepBodyBuffer=true")
+		}
+		if req.body != buf {
+			t.Fatalf("expected same req.body buffer instance after Reset")
+		}
+		if cap(req.body.B) <= 1024 {
+			t.Fatalf("expected capacity to be preserved, got %d", cap(req.body.B))
+		}
+
+		var defaultReq Request
+		defaultReq.SetBody(payload)
+		defaultReq.Reset()
+		if defaultReq.body != nil {
+			t.Fatalf("expected defaultReq.body to be nil after Reset when KeepBodyBuffer=false and limit exceeded")
+		}
+	})
+
+	t.Run("ClientDo", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write(payload)
+		}))
+		t.Cleanup(server.Close)
+
+		var client Client
+		t.Cleanup(client.CloseIdleConnections)
+
+		resp := AcquireResponse()
+		defer ReleaseResponse(resp)
+		resp.KeepBodyBuffer = true
+
+		var req Request
+		req.SetRequestURI(server.URL)
+
+		if err := client.Do(&req, resp); err != nil {
+			t.Fatalf("unexpected request error: %v", err)
+		}
+		buf := resp.body
+		if buf == nil || cap(buf.B) <= 1024 {
+			t.Fatalf("expected resp.body capacity > 1024, got %v", buf)
+		}
+
+		if err := client.Do(&req, resp); err != nil {
+			t.Fatalf("unexpected request error: %v", err)
+		}
+		if resp.body != buf {
+			t.Fatalf("expected resp.body to be reused across requests even with pool limit")
+		}
+	})
+
+	t.Run("PipelineClientDoTimeout", func(t *testing.T) {
+		smallPayload := []byte("small-16-bytes--")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/small" {
+				_, _ = w.Write(smallPayload)
+			} else {
+				_, _ = w.Write(payload)
+			}
+		}))
+		t.Cleanup(server.Close)
+
+		client := &PipelineClient{
+			Addr: strings.TrimPrefix(server.URL, "http://"),
+		}
+
+		resp := AcquireResponse()
+		defer ReleaseResponse(resp)
+		resp.KeepBodyBuffer = true
+
+		var req Request
+		req.SetRequestURI(server.URL)
+
+		if err := client.DoTimeout(&req, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if !resp.KeepBodyBuffer {
+			t.Fatalf("expected resp.KeepBodyBuffer to remain true after PipelineClient.DoTimeout")
+		}
+		buf := resp.body
+		if buf == nil || cap(buf.B) <= 1024 {
+			t.Fatalf("expected resp.body capacity > 1024, got %v", resp.body)
+		}
+		initialCap := cap(buf.B)
+
+		// Call again with a smaller response to ensure the retained buffer is kept and not replaced.
+		req.SetRequestURI(server.URL + "/small")
+		if err := client.DoTimeout(&req, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if !resp.KeepBodyBuffer {
+			t.Fatalf("expected resp.KeepBodyBuffer to remain true")
+		}
+		if resp.body != buf {
+			t.Fatalf("expected resp.body pointer to stay identical across calls, got %p != %p", resp.body, buf)
+		}
+		if cap(resp.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(resp.body.B))
+		}
+		if !bytes.Equal(resp.Body(), smallPayload) {
+			t.Fatalf("unexpected response body: %q", resp.Body())
+		}
+
+		// Third call with DoDeadline.
+		req.SetRequestURI(server.URL)
+		if err := client.DoDeadline(&req, resp, time.Now().Add(5*time.Second)); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if resp.body != buf {
+			t.Fatalf("expected resp.body pointer to stay identical after DoDeadline, got %p != %p", resp.body, buf)
+		}
+		if !bytes.Equal(resp.Body(), payload) {
+			t.Fatalf("unexpected response body: %q", resp.Body())
+		}
+
+		// Pre-retained 64 KB buffer should be preserved across small responses.
+		resp64 := AcquireResponse()
+		defer ReleaseResponse(resp64)
+		resp64.KeepBodyBuffer = true
+		resp64.SetBody(bytes.Repeat([]byte("z"), 65536))
+		buf64 := resp64.body
+		cap64 := cap(buf64.B)
+
+		req.SetRequestURI(server.URL + "/small")
+		if err := client.DoTimeout(&req, resp64, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if resp64.body != buf64 {
+			t.Fatalf("expected resp64.body pointer to be preserved, got %p != %p", resp64.body, buf64)
+		}
+		if cap(resp64.body.B) != cap64 {
+			t.Fatalf("expected capacity %d to be preserved, got %d", cap64, cap(resp64.body.B))
+		}
+		if !bytes.Equal(resp64.Body(), smallPayload) {
+			t.Fatalf("unexpected response body: %q", resp64.Body())
+		}
+	})
+
+	t.Run("PipelineClientTimeoutPreservesBuffer", func(t *testing.T) {
+		slowCh := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-slowCh:
+			default:
+				close(slowCh)
+			}
+		})
+
+		fastPayload := []byte("fast-response-bytes")
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/slow" {
+				select {
+				case <-slowCh:
+				case <-r.Context().Done():
+				}
+				_, _ = w.Write([]byte("slow-response"))
+				return
+			}
+			_, _ = w.Write(fastPayload)
+		}))
+		t.Cleanup(server.Close)
+
+		client := &PipelineClient{
+			Addr: strings.TrimPrefix(server.URL, "http://"),
+		}
+
+		// 1. Verify pre-retained 64 KB buffer is preserved upon ErrTimeout in DoTimeout.
+		resp := AcquireResponse()
+		defer ReleaseResponse(resp)
+		resp.KeepBodyBuffer = true
+		resp.SetBody(bytes.Repeat([]byte("z"), 65536))
+		buf := resp.body
+		initialCap := cap(buf.B)
+
+		var req Request
+		req.SetRequestURI(server.URL + "/slow")
+		err := client.DoTimeout(&req, resp, 25*time.Millisecond)
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("expected ErrTimeout, got %v", err)
+		}
+		if !resp.KeepBodyBuffer {
+			t.Fatalf("expected resp.KeepBodyBuffer to remain true after timeout")
+		}
+		if resp.body == nil {
+			t.Fatalf("expected resp.body to be non-nil after timeout")
+		}
+		if resp.body != buf {
+			t.Fatalf("expected resp.body pointer to be preserved after ErrTimeout, got %p != %p", resp.body, buf)
+		}
+		if cap(resp.body.B) != initialCap {
+			t.Fatalf("expected resp.body capacity %d to be preserved after timeout, got %d", initialCap, cap(resp.body.B))
+		}
+
+		// Unblock the slow handler so the worker finishes reading and the pipeline connection is ready.
+		close(slowCh)
+
+		// Subsequent request reuses the exact same retained buffer without reallocation.
+		req.SetRequestURI(server.URL + "/fast")
+		if err := client.DoTimeout(&req, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if resp.body != buf {
+			t.Fatalf("expected resp.body pointer to stay identical after subsequent request, got %p != %p", resp.body, buf)
+		}
+		if cap(resp.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(resp.body.B))
+		}
+		if !bytes.Equal(resp.Body(), fastPayload) {
+			t.Fatalf("unexpected response body: %q", resp.Body())
+		}
+
+		// 2. Verify DoDeadline also preserves caller's retained buffer upon ErrTimeout.
+		slowCh2 := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-slowCh2:
+			default:
+				close(slowCh2)
+			}
+		})
+		server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/slow" {
+				select {
+				case <-slowCh2:
+				case <-r.Context().Done():
+				}
+				_, _ = w.Write([]byte("slow-response"))
+				return
+			}
+			_, _ = w.Write(fastPayload)
+		}))
+		t.Cleanup(server2.Close)
+
+		client2 := &PipelineClient{
+			Addr: strings.TrimPrefix(server2.URL, "http://"),
+		}
+
+		req.SetRequestURI(server2.URL + "/slow")
+		err = client2.DoDeadline(&req, resp, time.Now().Add(25*time.Millisecond))
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("expected ErrTimeout from DoDeadline, got %v", err)
+		}
+		if resp.body != buf {
+			t.Fatalf("expected resp.body pointer to be preserved after DoDeadline timeout, got %p != %p", resp.body, buf)
+		}
+		if cap(resp.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(resp.body.B))
+		}
+
+		close(slowCh2)
+		req.SetRequestURI(server2.URL + "/fast")
+		if err := client2.DoDeadline(&req, resp, time.Now().Add(5*time.Second)); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if resp.body != buf {
+			t.Fatalf("expected resp.body pointer to stay identical after subsequent DoDeadline, got %p != %p", resp.body, buf)
+		}
+		if cap(resp.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(resp.body.B))
+		}
+		if !bytes.Equal(resp.Body(), fastPayload) {
+			t.Fatalf("unexpected response body: %q", resp.Body())
+		}
+
+		// 3. Dynamically acquired buffer from a successful call remains retained across a timeout.
+		respDyn := AcquireResponse()
+		defer ReleaseResponse(respDyn)
+		respDyn.KeepBodyBuffer = true
+
+		slowCh3 := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-slowCh3:
+			default:
+				close(slowCh3)
+			}
+		})
+		server3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/slow" {
+				select {
+				case <-slowCh3:
+				case <-r.Context().Done():
+				}
+				_, _ = w.Write([]byte("slow-response"))
+				return
+			}
+			_, _ = w.Write(payload)
+		}))
+		t.Cleanup(server3.Close)
+
+		client3 := &PipelineClient{
+			Addr: strings.TrimPrefix(server3.URL, "http://"),
+		}
+
+		req.SetRequestURI(server3.URL + "/fast")
+		if err := client3.DoTimeout(&req, respDyn, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		dynBuf := respDyn.body
+		if dynBuf == nil || cap(dynBuf.B) <= 1024 {
+			t.Fatalf("expected respDyn.body capacity > 1024, got %v", dynBuf)
+		}
+		dynCap := cap(dynBuf.B)
+
+		req.SetRequestURI(server3.URL + "/slow")
+		err = client3.DoTimeout(&req, respDyn, 25*time.Millisecond)
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("expected ErrTimeout, got %v", err)
+		}
+		if respDyn.body != dynBuf {
+			t.Fatalf("expected dynamically acquired respDyn.body to be preserved after ErrTimeout, got %p != %p", respDyn.body, dynBuf)
+		}
+		if cap(respDyn.body.B) != dynCap {
+			t.Fatalf("expected capacity %d to be preserved after timeout, got %d", dynCap, cap(respDyn.body.B))
+		}
+
+		close(slowCh3)
+		req.SetRequestURI(server3.URL + "/fast")
+		if err := client3.DoTimeout(&req, respDyn, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if respDyn.body != dynBuf {
+			t.Fatalf("expected respDyn.body pointer to stay identical across calls, got %p != %p", respDyn.body, dynBuf)
+		}
+		if cap(respDyn.body.B) != dynCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", dynCap, cap(respDyn.body.B))
+		}
+	})
+
+	t.Run("PipelineClientRequestBodyPreserved", func(t *testing.T) {
+		slowCh := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-slowCh:
+			default:
+				close(slowCh)
+			}
+		})
+
+		reqPayload64 := bytes.Repeat([]byte("k"), 65536)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			if r.URL.Path == "/slow" {
+				select {
+				case <-slowCh:
+				case <-r.Context().Done():
+				}
+				_, _ = w.Write([]byte("slow-done"))
+				return
+			}
+			if !bytes.Equal(body, reqPayload64) {
+				http.Error(w, "body mismatch", http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte("ok"))
+		}))
+		t.Cleanup(server.Close)
+
+		client := &PipelineClient{
+			Addr: strings.TrimPrefix(server.URL, "http://"),
+		}
+
+		// 1. Verify PipelineClient.Do preserves req.body address and capacity.
+		req := AcquireRequest()
+		defer ReleaseRequest(req)
+		req.Header.SetMethod(MethodPost)
+		req.SetRequestURI(server.URL)
+		req.KeepBodyBuffer = true
+		req.SetBody(reqPayload64)
+		buf := req.body
+		initialCap := cap(buf.B)
+
+		resp := AcquireResponse()
+		defer ReleaseResponse(resp)
+
+		if err := client.Do(req, resp); err != nil {
+			t.Fatalf("unexpected pipeline request error from Do: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after Do, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 2. Verify PipelineClient.DoTimeout preserves req.body address and capacity on success.
+		if err := client.DoTimeout(req, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error from DoTimeout: %v", err)
+		}
+		if !req.KeepBodyBuffer {
+			t.Fatalf("expected req.KeepBodyBuffer to remain true")
+		}
+		if req.body == nil {
+			t.Fatalf("expected req.body to be non-nil after DoTimeout success")
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoTimeout success, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+		if !bytes.Equal(req.Body(), reqPayload64) {
+			t.Fatalf("expected req body bytes to be intact")
+		}
+
+		// 3. Verify PipelineClient.DoDeadline preserves req.body address and capacity on success.
+		if err := client.DoDeadline(req, resp, time.Now().Add(5*time.Second)); err != nil {
+			t.Fatalf("unexpected pipeline request error from DoDeadline: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoDeadline success, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+		if !bytes.Equal(req.Body(), reqPayload64) {
+			t.Fatalf("expected req body bytes to be intact")
+		}
+
+		// 4. Verify PipelineClient.DoTimeout preserves req.body address and capacity on ErrTimeout.
+		req.SetRequestURI(server.URL + "/slow")
+		err := client.DoTimeout(req, resp, 25*time.Millisecond)
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("expected ErrTimeout, got %v", err)
+		}
+		if !req.KeepBodyBuffer {
+			t.Fatalf("expected req.KeepBodyBuffer to remain true after timeout")
+		}
+		if req.body == nil {
+			t.Fatalf("expected req.body to be non-nil after DoTimeout timeout")
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoTimeout timeout, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved after timeout, got %d", initialCap, cap(req.body.B))
+		}
+		if !bytes.Equal(req.Body(), reqPayload64) {
+			t.Fatalf("expected req body bytes to be intact after timeout")
+		}
+
+		// Unblock the slow handler.
+		close(slowCh)
+
+		// 5. Subsequent request reuses the exact same request buffer.
+		req.SetRequestURI(server.URL)
+		if err := client.DoTimeout(req, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to stay identical after subsequent DoTimeout, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 6. Verify PipelineClient.DoDeadline preserves req.body address and capacity on ErrTimeout.
+		slowCh2 := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-slowCh2:
+			default:
+				close(slowCh2)
+			}
+		})
+		server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			if r.URL.Path == "/slow" {
+				select {
+				case <-slowCh2:
+				case <-r.Context().Done():
+				}
+				_, _ = w.Write([]byte("slow-done"))
+				return
+			}
+			if !bytes.Equal(body, reqPayload64) {
+				http.Error(w, "body mismatch", http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte("ok"))
+		}))
+		t.Cleanup(server2.Close)
+
+		client2 := &PipelineClient{
+			Addr: strings.TrimPrefix(server2.URL, "http://"),
+		}
+
+		req.SetRequestURI(server2.URL + "/slow")
+		err = client2.DoDeadline(req, resp, time.Now().Add(25*time.Millisecond))
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("expected ErrTimeout from DoDeadline, got %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoDeadline timeout, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		close(slowCh2)
+		req.SetRequestURI(server2.URL)
+		if err := client2.DoDeadline(req, resp, time.Now().Add(5*time.Second)); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to stay identical after subsequent DoDeadline, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 7. Contrast with req.KeepBodyBuffer=false where buffer is nil'd after DoTimeout/DoDeadline.
+		defaultReq := AcquireRequest()
+		defer ReleaseRequest(defaultReq)
+		defaultReq.Header.SetMethod(MethodPost)
+		defaultReq.SetRequestURI(server2.URL)
+		defaultReq.SetBody(reqPayload64)
+		if err := client2.DoTimeout(defaultReq, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if defaultReq.body != nil {
+			t.Fatalf("expected defaultReq.body to be nil after DoTimeout when KeepBodyBuffer=false")
+		}
+	})
+
+	t.Run("PipelineClientRequestBodyPreservedStreamed", func(t *testing.T) {
+		slowCh := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-slowCh:
+			default:
+				close(slowCh)
+			}
+		})
+
+		reqPayload64 := bytes.Repeat([]byte("k"), 65536)
+		streamPayload32 := bytes.Repeat([]byte("s"), 32768)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			if r.URL.Path == "/slow" {
+				select {
+				case <-slowCh:
+				case <-r.Context().Done():
+				}
+				_, _ = w.Write([]byte("slow-done"))
+				return
+			}
+			if !bytes.Equal(body, reqPayload64) && !bytes.Equal(body, streamPayload32) {
+				http.Error(w, "body mismatch", http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte("ok"))
+		}))
+		t.Cleanup(server.Close)
+
+		client := &PipelineClient{
+			Addr: strings.TrimPrefix(server.URL, "http://"),
+		}
+
+		// 1. Preallocate 64 KB buffer on req with KeepBodyBuffer=true and verify Do preserves it with SetBodyStream.
+		req := AcquireRequest()
+		defer ReleaseRequest(req)
+		req.Header.SetMethod(MethodPost)
+		req.SetRequestURI(server.URL)
+		req.KeepBodyBuffer = true
+		req.SetBody(reqPayload64)
+		buf := req.body
+		initialCap := cap(buf.B)
+
+		resp := AcquireResponse()
+		defer ReleaseResponse(resp)
+
+		req.SetBodyStream(bytes.NewReader(streamPayload32), len(streamPayload32))
+		if req.body != buf {
+			t.Fatalf("expected req.body to remain attached after SetBodyStream, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d after SetBodyStream, got %d", initialCap, cap(req.body.B))
+		}
+
+		if err := client.Do(req, resp); err != nil {
+			t.Fatalf("unexpected pipeline request error from Do: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after Do, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 2. Verify PipelineClient.DoTimeout preserves req.body address and capacity on streamed success.
+		req.SetBodyStream(bytes.NewReader(streamPayload32), len(streamPayload32))
+		if err := client.DoTimeout(req, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error from DoTimeout: %v", err)
+		}
+		if !req.KeepBodyBuffer {
+			t.Fatalf("expected req.KeepBodyBuffer to remain true")
+		}
+		if req.body == nil {
+			t.Fatalf("expected req.body to be non-nil after DoTimeout success")
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoTimeout success, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 3. Alternate from streamed to buffered request; verify buffer is reused without reallocation.
+		req.SetBody(reqPayload64)
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to stay identical for buffered request, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+		if err := client.DoTimeout(req, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error from DoTimeout buffered: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoTimeout buffered, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 4. Verify PipelineClient.DoTimeout preserves req.body address and capacity on streamed ErrTimeout.
+		req.SetRequestURI(server.URL + "/slow")
+		req.SetBodyStream(bytes.NewReader(streamPayload32), len(streamPayload32))
+		err := client.DoTimeout(req, resp, 25*time.Millisecond)
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("expected ErrTimeout, got %v", err)
+		}
+		if !req.KeepBodyBuffer {
+			t.Fatalf("expected req.KeepBodyBuffer to remain true after timeout")
+		}
+		if req.body == nil {
+			t.Fatalf("expected req.body to be non-nil after DoTimeout timeout")
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoTimeout timeout, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved after timeout, got %d", initialCap, cap(req.body.B))
+		}
+
+		close(slowCh)
+
+		// 5. Subsequent buffered request reuses the exact same request buffer.
+		req.SetRequestURI(server.URL)
+		req.SetBody(reqPayload64)
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to stay identical after timeout, got %p != %p", req.body, buf)
+		}
+		if err := client.DoTimeout(req, resp, 5*time.Second); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to stay identical after subsequent DoTimeout, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 6. Verify PipelineClient.DoDeadline preserves req.body address and capacity on streamed success.
+		req.SetBodyStream(bytes.NewReader(streamPayload32), len(streamPayload32))
+		if err := client.DoDeadline(req, resp, time.Now().Add(5*time.Second)); err != nil {
+			t.Fatalf("unexpected pipeline request error from DoDeadline: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoDeadline success, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 7. Alternate from streamed to buffered request under DoDeadline.
+		req.SetBody(reqPayload64)
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to stay identical for buffered request, got %p != %p", req.body, buf)
+		}
+		if err := client.DoDeadline(req, resp, time.Now().Add(5*time.Second)); err != nil {
+			t.Fatalf("unexpected pipeline request error from DoDeadline buffered: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoDeadline buffered, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected req.body capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		// 8. Verify PipelineClient.DoDeadline preserves req.body address and capacity on streamed ErrTimeout.
+		slowCh2 := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-slowCh2:
+			default:
+				close(slowCh2)
+			}
+		})
+		server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			if r.URL.Path == "/slow" {
+				select {
+				case <-slowCh2:
+				case <-r.Context().Done():
+				}
+				_, _ = w.Write([]byte("slow-done"))
+				return
+			}
+			if !bytes.Equal(body, reqPayload64) && !bytes.Equal(body, streamPayload32) {
+				http.Error(w, "body mismatch", http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte("ok"))
+		}))
+		t.Cleanup(server2.Close)
+
+		client2 := &PipelineClient{
+			Addr: strings.TrimPrefix(server2.URL, "http://"),
+		}
+
+		req.SetRequestURI(server2.URL + "/slow")
+		req.SetBodyStream(bytes.NewReader(streamPayload32), len(streamPayload32))
+		err = client2.DoDeadline(req, resp, time.Now().Add(25*time.Millisecond))
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("expected ErrTimeout from DoDeadline, got %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to be preserved after DoDeadline timeout, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+
+		close(slowCh2)
+
+		// 9. Subsequent buffered request under DoDeadline reuses the preserved buffer.
+		req.SetRequestURI(server2.URL)
+		req.SetBody(reqPayload64)
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to stay identical after timeout, got %p != %p", req.body, buf)
+		}
+		if err := client2.DoDeadline(req, resp, time.Now().Add(5*time.Second)); err != nil {
+			t.Fatalf("unexpected pipeline request error: %v", err)
+		}
+		if req.body != buf {
+			t.Fatalf("expected req.body pointer to stay identical after subsequent DoDeadline, got %p != %p", req.body, buf)
+		}
+		if cap(req.body.B) != initialCap {
+			t.Fatalf("expected capacity %d to be preserved, got %d", initialCap, cap(req.body.B))
+		}
+	})
+}
+
 func TestResponseRawBodyCopyTo(t *testing.T) {
 	t.Parallel()
 
@@ -2867,6 +4926,64 @@ func TestResponseImmediateHeaderFlushRegressionChunked(t *testing.T) {
 	r.ImmediateHeaderFlush = true
 
 	testBodyWriteTo(t, &r, expectedS, false)
+}
+
+type bodyReadFunc func([]byte) (int, error)
+
+func (f bodyReadFunc) Read(p []byte) (int, error) {
+	return f(p)
+}
+
+func TestFixedSizeBodyStreamLength(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		body   string
+		size   int
+		stream string
+	}{
+		{name: "empty"},
+		{name: "short", body: "ab", size: 3},
+		{name: "exact", body: "abc", size: 3},
+		{name: "long-reader", body: "abcdef", size: 3},
+		{name: "long-WriterTo", body: "abcdef", size: 3, stream: "bytes"},
+		{name: "long-StringWriter", body: "abcdef", size: 3, stream: "strings"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var stream io.Reader
+			switch tc.stream {
+			case "bytes":
+				stream = bytes.NewReader([]byte(tc.body))
+			case "strings":
+				stream = strings.NewReader(tc.body)
+			default:
+				stream = bodyReadFunc(strings.NewReader(tc.body).Read)
+			}
+			var wire bytes.Buffer
+			w := bufio.NewWriter(struct{ io.Writer }{&wire})
+			var bw *fixedSizeBodyWriter
+			err := writeBodyFixedSize(w, stream, int64(tc.size), &bw)
+			switch {
+			case len(tc.body) < tc.size:
+				if err == nil {
+					t.Fatal("expected an error for a short body stream")
+				}
+			case len(tc.body) > tc.size:
+				if !errors.Is(err, errBodyStreamTooLong) {
+					t.Fatalf("write error = %v, want oversized stream error", err)
+				}
+			case err != nil:
+				t.Fatal(err)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if want := tc.body[:min(len(tc.body), tc.size)]; wire.String() != want {
+				t.Fatalf("written body = %q, want %q", wire.String(), want)
+			}
+		})
+	}
 }
 
 func TestResponseImmediateHeaderFlushFixedLength(t *testing.T) {
@@ -3112,25 +5229,81 @@ func TestResponseBodyStream(t *testing.T) {
 			t.Fatalf("unexpected body content, got: %#v, want: %#v", string(body), "1234561234567")
 		}
 	})
-	t.Run("read simple response", func(t *testing.T) {
+	t.Run("read fixed-length response", func(t *testing.T) {
+		for _, maxBodySize := range []int{0, 8, 20} {
+			t.Run(fmt.Sprintf("maxBodySize=%d", maxBodySize), func(t *testing.T) {
+				resp := AcquireResponse()
+				defer ReleaseResponse(resp)
+				resp.StreamBody = true
+				if err := resp.ReadLimitBody(bufio.NewReader(bytes.NewBufferString(simpleResp)), maxBodySize); err != nil {
+					t.Fatalf("read limit body err: %v", err)
+				}
+				if _, ok := resp.BodyStream().(*requestStream); !ok {
+					t.Fatalf("unexpected body stream type %T", resp.BodyStream())
+				}
+				if body := resp.bodyBytes(); len(body) != 0 {
+					t.Fatalf("response body was buffered: %q", body)
+				}
+				content, err := io.ReadAll(resp.BodyStream())
+				if err != nil {
+					t.Fatalf("read body stream err: %v", err)
+				}
+				if string(content) != "123456789" {
+					t.Fatalf("unexpected body content, got: %#v, want: %#v", string(content), "123456789")
+				}
+				if err := resp.CloseBodyStream(); err != nil {
+					t.Fatalf("close body stream err: %v", err)
+				}
+			})
+		}
+	})
+	t.Run("truncated fixed-length response", func(t *testing.T) {
 		resp := AcquireResponse()
+		defer ReleaseResponse(resp)
 		resp.StreamBody = true
-		err := resp.ReadLimitBody(bufio.NewReader(bytes.NewBufferString(simpleResp)), 8)
-		if err != nil {
-			t.Fatalf("read limit body err: %v", err)
+		response := "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n1234"
+		if err := resp.Read(bufio.NewReader(bytes.NewBufferString(response))); err != nil {
+			t.Fatalf("read response headers err: %v", err)
 		}
-		body := resp.BodyStream()
-		defer func() {
-			if err := resp.CloseBodyStream(); err != nil {
-				t.Fatalf("close body stream err: %v", err)
-			}
-		}()
-		content, err := io.ReadAll(body)
-		if err != nil {
-			t.Fatalf("read limit body err: %v", err)
+		if _, err := io.ReadAll(resp.BodyStream()); err != io.ErrUnexpectedEOF {
+			t.Fatalf("unexpected body stream error: %v; want %v", err, io.ErrUnexpectedEOF)
 		}
-		if string(content) != "123456789" {
-			t.Fatalf("unexpected body content, got: %#v, want: %#v", string(content), "123456789")
+	})
+	t.Run("fixed-length stream keeps original framing", func(t *testing.T) {
+		resp := AcquireResponse()
+		defer ReleaseResponse(resp)
+		resp.StreamBody = true
+		if err := resp.Read(bufio.NewReader(bytes.NewBufferString(simpleResp))); err != nil {
+			t.Fatalf("read response headers err: %v", err)
+		}
+		resp.Header.SetContentLength(1)
+		body, err := io.ReadAll(resp.BodyStream())
+		if err != nil {
+			t.Fatalf("read body stream err: %v", err)
+		}
+		if string(body) != "123456789" {
+			t.Fatalf("unexpected body content, got: %#v, want: %#v", string(body), "123456789")
+		}
+	})
+	t.Run("copy streamed response after reading body", func(t *testing.T) {
+		var resp Response
+		resp.StreamBody = true
+		if err := resp.Read(bufio.NewReader(bytes.NewBufferString(simpleResp))); err != nil {
+			t.Fatalf("read response headers err: %v", err)
+		}
+
+		var dst Response
+		resp.CopyTo(&dst)
+		if body := dst.Body(); len(body) != 0 {
+			t.Fatalf("CopyTo copied an unread body stream: %q", body)
+		}
+
+		if body := resp.Body(); string(body) != "123456789" {
+			t.Fatalf("unexpected drained body %q", body)
+		}
+		resp.CopyTo(&dst)
+		if body := string(dst.Body()); body != "123456789" {
+			t.Fatalf("CopyTo did not copy the buffered body: %q", body)
 		}
 	})
 	t.Run("http client", func(t *testing.T) {
@@ -3141,7 +5314,7 @@ func TestResponseBodyStream(t *testing.T) {
 				for x := range 10 {
 					time.Sleep(time.Millisecond)
 					writer.Write([]byte(strconv.Itoa(x))) //nolint:errcheck
-					writer.(http.Flusher).Flush()
+					writer.(http.Flusher).Flush()         //nolint:forcetypeassert
 				}
 				return
 			}
@@ -3214,13 +5387,80 @@ func TestResponseBodyStream(t *testing.T) {
 			}
 		})
 
+		t.Run("direct close with error releases client stream", func(t *testing.T) {
+			t.Parallel()
+
+			client := Client{StreamResponseBody: true, MaxConnsPerHost: 1}
+			resp := AcquireResponse()
+			defer ReleaseResponse(resp)
+			request := AcquireRequest()
+			defer ReleaseRequest(request)
+			request.SetRequestURI(server.URL + "?chunked=true")
+			if err := client.Do(request, resp); err != nil {
+				t.Fatal(err)
+			}
+			stream, ok := resp.BodyStream().(ReadCloserWithError)
+			if !ok {
+				t.Fatalf("unexpected body stream type %T", resp.BodyStream())
+			}
+			if err := stream.CloseWithError(errors.New("client closed")); err != nil {
+				t.Fatalf("close body stream err: %v", err)
+			}
+			if err := stream.CloseWithError(errors.New("client closed again")); err != nil {
+				t.Fatalf("close body stream twice err: %v", err)
+			}
+
+			resp2 := AcquireResponse()
+			defer ReleaseResponse(resp2)
+			request2 := AcquireRequest()
+			defer ReleaseRequest(request2)
+			request2.SetRequestURI(server.URL)
+			if err := client.Do(request2, resp2); err != nil {
+				t.Fatalf("second request err: %v", err)
+			}
+		})
+
+		t.Run("compressed write releases client stream", func(t *testing.T) {
+			t.Parallel()
+
+			client := Client{StreamResponseBody: true, MaxConnsPerHost: 1}
+
+			resp := AcquireResponse()
+			defer ReleaseResponse(resp)
+			request := AcquireRequest()
+			defer ReleaseRequest(request)
+
+			request.SetRequestURI(server.URL)
+			if err := client.Do(request, resp); err != nil {
+				t.Fatal(err)
+			}
+
+			bw := bufio.NewWriter(io.Discard)
+			if err := resp.WriteGzip(bw); err != nil {
+				t.Fatalf("write gzip response err: %v", err)
+			}
+			if err := bw.Flush(); err != nil {
+				t.Fatalf("flush gzip response err: %v", err)
+			}
+
+			resp2 := AcquireResponse()
+			defer ReleaseResponse(resp2)
+			request2 := AcquireRequest()
+			defer ReleaseRequest(request2)
+
+			request2.SetRequestURI(server.URL)
+			if err := client.Do(request2, resp2); err != nil {
+				t.Fatalf("second request err: %v", err)
+			}
+		})
+
 		t.Run("identity", func(t *testing.T) {
 			t.Parallel()
 
 			client := Client{StreamResponseBody: true, DisablePathNormalizing: true}
 			resp := AcquireResponse()
 			request := AcquireRequest()
-			request.SetRequestURI(server.URL + "?400BadRequest")
+			request.SetRequestURI(server.URL + "?foo=bar")
 			if err := client.Do(request, resp); err != nil {
 				t.Fatal(err)
 			}
@@ -3234,11 +5474,258 @@ func TestResponseBodyStream(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(content) != "400 Bad Request" {
-				t.Fatalf("unexpected body content, got: %#v, want: %#v", string(content), "400 Bad Request")
+			if string(content) != "hello world" {
+				t.Fatalf("unexpected body content, got: %#v, want: %#v", string(content), "hello world")
 			}
 		})
 	})
+}
+
+func TestResponseCompressedBodyStreamCloseClosesOriginal(t *testing.T) {
+	t.Parallel()
+
+	bodyStream := &blockingCloseReader{
+		closed: make(chan struct{}),
+	}
+
+	var resp Response
+	resp.Header.SetContentType("text/plain")
+	resp.SetBodyStream(bodyStream, -1)
+	resp.gzipBody(CompressDefaultCompression)
+
+	if err := resp.CloseBodyStream(); err != nil {
+		t.Fatalf("unexpected close error: %v", err)
+	}
+
+	select {
+	case <-bodyStream.closed:
+	case <-time.After(testTimeout(time.Second)):
+		t.Fatalf("timeout waiting for original body stream close")
+	}
+}
+
+func TestResponseCompressedBodyStreamCloseKeepsWriteError(t *testing.T) {
+	t.Parallel()
+
+	readCh := make(chan struct{})
+	closeErrCh := make(chan error, 1)
+	bodyStream := newCloseReaderWithError(&gatedReader{
+		readCh: readCh,
+		data:   []byte(strings.Repeat("body", 1024)),
+	}, func(err error) error {
+		closeErrCh <- err
+		return nil
+	})
+
+	var resp Response
+	resp.Header.SetContentType("text/plain")
+	resp.SetBodyStream(bodyStream, -1)
+	resp.gzipBody(CompressDefaultCompression)
+	// Compression starts with the first read.
+	_, _ = resp.BodyStream().Read(nil)
+
+	if err := resp.CloseBodyStream(); err != nil {
+		t.Fatalf("unexpected close error: %v", err)
+	}
+	close(readCh)
+
+	select {
+	case err := <-closeErrCh:
+		if err == nil {
+			t.Fatalf("unexpected nil close error")
+		}
+	case <-time.After(testTimeout(time.Second)):
+		t.Fatalf("timeout waiting for original body stream close")
+	}
+}
+
+func TestResponseCompressedBodyStreamCloseDoesNotReleaseRequestStreamBeforeReadDone(t *testing.T) {
+	t.Parallel()
+
+	reader := &blockingOnceReader{
+		reading: make(chan struct{}),
+		unblock: make(chan struct{}),
+	}
+
+	var bodyBuf bytebufferpool.ByteBuffer
+	rs := acquireRequestStream(&bodyBuf, bufio.NewReader(reader), fixedRequestStreamHeader{contentLength: 1})
+
+	var resp Response
+	resp.Header.SetContentType("text/plain")
+	resp.SetBodyStream(rs, -1)
+	resp.gzipBody(CompressDefaultCompression)
+	compressedStream := resp.bodyStream.(*compressedBodyStream) //nolint:forcetypeassert
+	// Compression starts with the first read.
+	_, _ = compressedStream.Read(nil)
+
+	select {
+	case <-reader.reading:
+	case <-time.After(testTimeout(time.Second)):
+		t.Fatalf("timeout waiting for request stream read")
+	}
+
+	if err := resp.CloseBodyStream(); err != nil {
+		t.Fatalf("unexpected close error: %v", err)
+	}
+	select {
+	case <-compressedStream.done:
+		t.Fatal("compression finished before its body read was unblocked")
+	default:
+	}
+
+	close(reader.unblock)
+	select {
+	case <-compressedStream.done:
+	case <-time.After(testTimeout(time.Second)):
+		t.Fatalf("timeout waiting for compressed stream cleanup")
+	}
+}
+
+// A body stream may finish the trailers as it ends: under compression it is
+// still read only while the response is written, after the headers.
+func TestResponseCompressedBodyStreamSetsTrailersAtEOF(t *testing.T) {
+	t.Parallel()
+
+	var resp Response
+	resp.Header.SetContentType("text/plain")
+	resp.Header.Set(HeaderTrailer, "X-Sum")
+	resp.SetBodyStream(&trailerAtEOF{r: strings.NewReader("body"), h: &resp.Header}, -1)
+	resp.gzipBody(CompressDefaultCompression)
+
+	var got Response
+	if err := got.Read(bufio.NewReader(strings.NewReader(resp.String()))); err != nil {
+		t.Fatal(err)
+	}
+	if v := got.Header.Peek("X-Sum"); string(v) != "1" {
+		t.Fatalf("X-Sum = %q, want 1", v)
+	}
+}
+
+type trailerAtEOF struct {
+	r io.Reader
+	h *ResponseHeader
+}
+
+func (b *trailerAtEOF) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if err == io.EOF {
+		b.h.Set("X-Sum", "1")
+	}
+	return n, err
+}
+
+type blockingCloseReader struct {
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+func (r *blockingCloseReader) Read(p []byte) (int, error) {
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *blockingCloseReader) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.closed)
+	})
+	return nil
+}
+
+type gatedReader struct {
+	readCh <-chan struct{}
+	data   []byte
+	done   bool
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	<-r.readCh
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	return copy(p, r.data), nil
+}
+
+type fixedRequestStreamHeader struct {
+	contentLength int
+}
+
+func (h fixedRequestStreamHeader) ContentLength() int {
+	return h.contentLength
+}
+
+func (fixedRequestStreamHeader) ReadTrailer(r *bufio.Reader) error {
+	return nil
+}
+
+func TestRequestBodyTruncatedStreamKeepsPartialBody(t *testing.T) {
+	t.Parallel()
+
+	var req Request
+	req.Header.SetContentLength(9)
+	req.bodyStream = acquireRequestStream(
+		req.bodyBuffer(),
+		bufio.NewReader(strings.NewReader("1234")),
+		&req.Header,
+	)
+
+	if body := string(req.Body()); body != "1234" {
+		t.Fatalf("unexpected request body %q; want partial body %q", body, "1234")
+	}
+}
+
+func TestAcquireRequestStreamAllocations(t *testing.T) {
+	var bodyBuf bytebufferpool.ByteBuffer
+	reader := bufio.NewReader(bytes.NewReader(nil))
+	header := fixedRequestStreamHeader{contentLength: 0}
+	allocs := testing.AllocsPerRun(1000, func() {
+		rs := acquireRequestStream(&bodyBuf, reader, header)
+		releaseRequestStream(rs)
+	})
+	if allocs != 0 {
+		t.Fatalf("unexpected allocations per request stream acquire: %v", allocs)
+	}
+}
+
+func TestReleasedRequestStreamReadPanics(t *testing.T) {
+	var bodyBuf bytebufferpool.ByteBuffer
+	rs := acquireRequestStream(
+		&bodyBuf,
+		bufio.NewReader(bytes.NewReader(nil)),
+		fixedRequestStreamHeader{contentLength: 0},
+	)
+	releaseRequestStream(rs)
+
+	defer func() {
+		if recover() == nil {
+			t.Fatal("reading a released request stream did not panic")
+		}
+	}()
+	_, _ = rs.Read(make([]byte, 1))
+}
+
+type blockingOnceReader struct {
+	reading   chan struct{}
+	unblock   chan struct{}
+	readOnce  sync.Once
+	valueOnce sync.Once
+}
+
+func (r *blockingOnceReader) Read(p []byte) (int, error) {
+	r.readOnce.Do(func() {
+		close(r.reading)
+	})
+	<-r.unblock
+
+	wrote := false
+	r.valueOnce.Do(func() {
+		p[0] = 'x'
+		wrote = true
+	})
+	if !wrote {
+		return 0, io.EOF
+	}
+	return 1, nil
 }
 
 func TestRequestMultipartFormPipeEmptyFormField(t *testing.T) {
@@ -3368,10 +5855,10 @@ func TestRequestGetTimeOut(t *testing.T) {
 		timeout  time.Duration
 		expected time.Duration
 	}{
-		{"Timeout set to 0", 0, 0},
-		{"Timeout set to 5s", 5 * time.Second, 5 * time.Second},
-		{"Timeout set to 1m", 1 * time.Minute, 1 * time.Minute},
-		{"Timeout set to 500ms", 500 * time.Millisecond, 500 * time.Millisecond},
+		{"timeout set to 0", 0, 0},
+		{"timeout set to 5s", 5 * time.Second, 5 * time.Second},
+		{"timeout set to 1m", 1 * time.Minute, 1 * time.Minute},
+		{"timeout set to 500ms", 500 * time.Millisecond, 500 * time.Millisecond},
 	}
 
 	for _, test := range tests {
@@ -3382,5 +5869,532 @@ func TestRequestGetTimeOut(t *testing.T) {
 				t.Errorf("GetTimeOut() = %v, want %v", got, test.expected)
 			}
 		})
+	}
+}
+
+// chunkedOptInBody opts in, so writeBodyChunked must use WriteTo, not Read.
+type chunkedOptInBody struct {
+	r        *bytes.Reader
+	readCnt  int
+	writeCnt int
+}
+
+func (b *chunkedOptInBody) Read(p []byte) (int, error) {
+	b.readCnt++
+	return b.r.Read(p)
+}
+
+func (b *chunkedOptInBody) WriteTo(w io.Writer) (int64, error) {
+	b.writeCnt++
+	return b.r.WriteTo(w)
+}
+
+func (b *chunkedOptInBody) SupportsBodyWriteTo() bool { return true }
+
+func TestWriteBodyChunkedWriterToOptIn(t *testing.T) {
+	t.Parallel()
+
+	body := string(createFixedBody(10001))
+	stream := &chunkedOptInBody{r: bytes.NewReader([]byte(body))}
+
+	var resp Response
+	resp.SetBodyStream(stream, -1)
+
+	var w bytes.Buffer
+	bw := bufio.NewWriter(&w)
+	if err := resp.Write(bw); err != nil {
+		t.Fatalf("unexpected error when writing response: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("unexpected error when flushing response: %v", err)
+	}
+
+	if stream.writeCnt != 1 {
+		t.Fatalf("WriteTo must be called once, got %d", stream.writeCnt)
+	}
+	if stream.readCnt != 0 {
+		t.Fatalf("Read must not be called on an opted-in body, got %d", stream.readCnt)
+	}
+
+	var resp1 Response
+	if err := resp1.Read(bufio.NewReader(&w)); err != nil {
+		t.Fatalf("unexpected error when reading response: %v", err)
+	}
+	if string(resp1.Body()) != body {
+		t.Fatalf("unexpected body of len %d. Expecting len %d", len(resp1.Body()), len(body))
+	}
+}
+
+// promotedWriterToBody has WriteTo promoted from an embedded reader while Read
+// is overridden — TestRevertPull1233's F pattern. Without the marker it must
+// not opt in, or the overridden Read is bypassed.
+type embeddedWriterTo struct {
+	r        *bytes.Reader
+	writeCnt int
+}
+
+func (e *embeddedWriterTo) Read(p []byte) (int, error) { return e.r.Read(p) }
+
+func (e *embeddedWriterTo) WriteTo(w io.Writer) (int64, error) {
+	e.writeCnt++
+	return e.r.WriteTo(w)
+}
+
+type promotedWriterToBody struct {
+	*embeddedWriterTo // WriteTo is promoted from here
+
+	readCnt int
+}
+
+func (b *promotedWriterToBody) Read(p []byte) (int, error) {
+	b.readCnt++
+	return b.embeddedWriterTo.Read(p)
+}
+
+func TestWriteBodyChunkedPromotedWriterToNotOptIn(t *testing.T) {
+	t.Parallel()
+
+	body := string(createFixedBody(10001))
+	inner := &embeddedWriterTo{r: bytes.NewReader([]byte(body))}
+	stream := &promotedWriterToBody{embeddedWriterTo: inner}
+
+	// The promoted WriteTo makes stream satisfy io.WriterTo, but not
+	// BodyWriterTo.
+	if _, ok := any(stream).(io.WriterTo); !ok {
+		t.Fatal("test setup: stream must satisfy io.WriterTo via promotion")
+	}
+	if _, ok := any(stream).(BodyWriterTo); ok {
+		t.Fatal("test setup: stream must NOT satisfy BodyWriterTo")
+	}
+
+	var resp Response
+	resp.SetBodyStream(stream, -1)
+
+	var w bytes.Buffer
+	bw := bufio.NewWriter(&w)
+	if err := resp.Write(bw); err != nil {
+		t.Fatalf("unexpected error when writing response: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("unexpected error when flushing response: %v", err)
+	}
+
+	if stream.readCnt == 0 {
+		t.Fatal("Read must be used when the body did not opt in")
+	}
+	if inner.writeCnt != 0 {
+		t.Fatalf("promoted WriteTo must not be called, got %d", inner.writeCnt)
+	}
+
+	var resp1 Response
+	if err := resp1.Read(bufio.NewReader(&w)); err != nil {
+		t.Fatalf("unexpected error when reading response: %v", err)
+	}
+	if string(resp1.Body()) != body {
+		t.Fatalf("unexpected body of len %d. Expecting len %d", len(resp1.Body()), len(body))
+	}
+}
+
+// optInInner supports zero-copy framing; optOutBody embeds it but overrides
+// SupportsBodyWriteTo to return false, opting back out.
+type optInInner struct {
+	r        *bytes.Reader
+	readCnt  int
+	writeCnt int
+}
+
+func (e *optInInner) Read(p []byte) (int, error) {
+	e.readCnt++
+	return e.r.Read(p)
+}
+
+func (e *optInInner) WriteTo(w io.Writer) (int64, error) {
+	e.writeCnt++
+	return e.r.WriteTo(w)
+}
+
+func (e *optInInner) SupportsBodyWriteTo() bool { return true }
+
+type optOutBody struct {
+	*optInInner
+
+	readCnt int
+}
+
+func (b *optOutBody) Read(p []byte) (int, error) {
+	b.readCnt++
+	return b.optInInner.Read(p)
+}
+
+func (b *optOutBody) SupportsBodyWriteTo() bool { return false }
+
+func TestBodyStreamOperationsPreserveLegacyWriterToUnlessOverridden(t *testing.T) {
+	t.Parallel()
+
+	// Exceed the bounded reader capacity so materialization must drain the producer.
+	body := createFixedBody(384*1024 + 23)
+	operations := []struct {
+		name string
+		run  func(io.Reader) ([]byte, error)
+	}{
+		{
+			name: "response Body",
+			run: func(stream io.Reader) ([]byte, error) {
+				var resp Response
+				resp.SetBodyStream(stream, -1)
+				return resp.Body(), nil
+			},
+		},
+		{
+			name: "request Body",
+			run: func(stream io.Reader) ([]byte, error) {
+				var req Request
+				req.SetBodyStream(stream, -1)
+				return req.Body(), nil
+			},
+		},
+		{
+			name: "response BodyWriteTo",
+			run: func(stream io.Reader) ([]byte, error) {
+				var resp Response
+				resp.SetBodyStream(stream, -1)
+
+				var dst bytes.Buffer
+				if err := resp.BodyWriteTo(&dst); err != nil {
+					return nil, err
+				}
+				return dst.Bytes(), nil
+			},
+		},
+		{
+			name: "request BodyWriteTo",
+			run: func(stream io.Reader) ([]byte, error) {
+				var req Request
+				req.SetBodyStream(stream, -1)
+
+				var dst bytes.Buffer
+				if err := req.BodyWriteTo(&dst); err != nil {
+					return nil, err
+				}
+				return dst.Bytes(), nil
+			},
+		},
+		{
+			name: "response SwapBody",
+			run: func(stream io.Reader) ([]byte, error) {
+				var resp Response
+				resp.SetBodyStream(stream, -1)
+				body := resp.SwapBody([]byte("replacement"))
+				if got := resp.Body(); string(got) != "replacement" {
+					return nil, fmt.Errorf("replacement body = %q", got)
+				}
+				return body, nil
+			},
+		},
+		{
+			name: "request SwapBody",
+			run: func(stream io.Reader) ([]byte, error) {
+				var req Request
+				req.SetBodyStream(stream, -1)
+				body := req.SwapBody([]byte("replacement"))
+				if got := req.Body(); string(got) != "replacement" {
+					return nil, fmt.Errorf("replacement body = %q", got)
+				}
+				return body, nil
+			},
+		},
+		{
+			name: "fixed-size response write",
+			run: func(stream io.Reader) ([]byte, error) {
+				var resp Response
+				resp.SetBodyStream(stream, len(body))
+
+				var dst bytes.Buffer
+				bw := bufio.NewWriter(&dst)
+				if err := resp.Write(bw); err != nil {
+					return nil, err
+				}
+				if err := bw.Flush(); err != nil {
+					return nil, err
+				}
+
+				var decoded Response
+				if err := decoded.Read(bufio.NewReader(&dst)); err != nil {
+					return nil, err
+				}
+				return decoded.Body(), nil
+			},
+		},
+		{
+			name: "gzip response write",
+			run: func(stream io.Reader) ([]byte, error) {
+				var resp Response
+				resp.Header.SetContentType("text/plain")
+				resp.SetBodyStream(stream, -1)
+
+				var dst bytes.Buffer
+				bw := bufio.NewWriter(&dst)
+				if err := resp.WriteGzip(bw); err != nil {
+					return nil, err
+				}
+				if err := bw.Flush(); err != nil {
+					return nil, err
+				}
+
+				var decoded Response
+				if err := decoded.Read(bufio.NewReader(&dst)); err != nil {
+					return nil, err
+				}
+				return decoded.BodyGunzip()
+			},
+		},
+	}
+
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			t.Run("bounded stream", func(t *testing.T) {
+				sw, done := streamCompatProducer(body, 64*1024, 0)
+				stream := NewBoundedStreamReader(sw)
+				defer streamClose(t, stream)
+				got, err := operation.run(stream)
+				if err != nil || !bytes.Equal(got, body) {
+					t.Fatalf("body length=%d, error=%v; want %d bytes", len(got), err, len(body))
+				}
+				if err := streamAwait(t, done, "bounded producer"); err != nil {
+					t.Fatal(err)
+				}
+			})
+
+			t.Run("unmarked WriterTo keeps legacy behavior", func(t *testing.T) {
+				inner := &embeddedWriterTo{r: bytes.NewReader(body)}
+				stream := &promotedWriterToBody{embeddedWriterTo: inner}
+
+				got, err := operation.run(stream)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if !bytes.Equal(got, body) {
+					t.Fatalf("unexpected body of len %d. Expecting len %d", len(got), len(body))
+				}
+				if inner.writeCnt != 1 {
+					t.Fatalf("WriteTo must be called once, got %d", inner.writeCnt)
+				}
+				if stream.readCnt != 0 {
+					t.Fatalf("Read must not be called for an unmarked legacy WriterTo, got %d", stream.readCnt)
+				}
+			})
+
+			t.Run("explicit opt-in uses WriterTo", func(t *testing.T) {
+				stream := &optInInner{r: bytes.NewReader(body)}
+
+				got, err := operation.run(stream)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if !bytes.Equal(got, body) {
+					t.Fatalf("unexpected body of len %d. Expecting len %d", len(got), len(body))
+				}
+				if stream.writeCnt != 1 {
+					t.Fatalf("WriteTo must be called once, got %d", stream.writeCnt)
+				}
+				if stream.readCnt != 0 {
+					t.Fatalf("Read must not be called for an opted-in BodyWriterTo, got %d", stream.readCnt)
+				}
+			})
+
+			t.Run("explicit opt-out uses Read", func(t *testing.T) {
+				inner := &optInInner{r: bytes.NewReader(body)}
+				stream := &optOutBody{optInInner: inner}
+
+				got, err := operation.run(stream)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if !bytes.Equal(got, body) {
+					t.Fatalf("unexpected body of len %d. Expecting len %d", len(got), len(body))
+				}
+				if inner.writeCnt != 0 {
+					t.Fatalf("WriteTo must not be called after opting out, got %d", inner.writeCnt)
+				}
+				if stream.readCnt == 0 {
+					t.Fatal("Read must be called after opting out")
+				}
+			})
+		})
+	}
+}
+
+func TestWriteBodyChunkedOptOutOverride(t *testing.T) {
+	t.Parallel()
+
+	body := string(createFixedBody(10001))
+	inner := &optInInner{r: bytes.NewReader([]byte(body))}
+	stream := &optOutBody{optInInner: inner}
+
+	// stream implements BodyWriterTo (the method is promoted/overridden), but
+	// its SupportsBodyWriteTo returns false, so it must use Read.
+	if _, ok := any(stream).(BodyWriterTo); !ok {
+		t.Fatal("test setup: stream must implement BodyWriterTo")
+	}
+
+	var resp Response
+	resp.SetBodyStream(stream, -1)
+
+	var w bytes.Buffer
+	bw := bufio.NewWriter(&w)
+	if err := resp.Write(bw); err != nil {
+		t.Fatalf("unexpected error when writing response: %v", err)
+	}
+	if err := bw.Flush(); err != nil {
+		t.Fatalf("unexpected error when flushing response: %v", err)
+	}
+
+	if stream.readCnt == 0 {
+		t.Fatal("Read must be used when the body opted back out")
+	}
+	if inner.writeCnt != 0 {
+		t.Fatalf("WriteTo must not be called after opting out, got %d", inner.writeCnt)
+	}
+
+	var resp1 Response
+	if err := resp1.Read(bufio.NewReader(&w)); err != nil {
+		t.Fatalf("unexpected error when reading response: %v", err)
+	}
+	if string(resp1.Body()) != body {
+		t.Fatalf("unexpected body of len %d. Expecting len %d", len(resp1.Body()), len(body))
+	}
+}
+
+// Standard bytes types take the zero-copy path without implementing
+// BodyWriterTo; the output must still be correct.
+func TestWriteBodyChunkedConcreteTypes(t *testing.T) {
+	t.Parallel()
+
+	body := string(createFixedBody(10001))
+	newReaders := []func() io.Reader{
+		func() io.Reader { return bytes.NewReader([]byte(body)) },
+		func() io.Reader { return bytes.NewBufferString(body) },
+	}
+	for _, newReader := range newReaders {
+		var resp Response
+		resp.SetBodyStream(newReader(), -1)
+
+		var w bytes.Buffer
+		bw := bufio.NewWriter(&w)
+		if err := resp.Write(bw); err != nil {
+			t.Fatalf("unexpected error when writing response: %v", err)
+		}
+		if err := bw.Flush(); err != nil {
+			t.Fatalf("unexpected error when flushing response: %v", err)
+		}
+
+		var resp1 Response
+		if err := resp1.Read(bufio.NewReader(&w)); err != nil {
+			t.Fatalf("unexpected error when reading response: %v", err)
+		}
+		if string(resp1.Body()) != body {
+			t.Fatalf("unexpected body of len %d. Expecting len %d", len(resp1.Body()), len(body))
+		}
+	}
+}
+
+func TestResponseWriteAlternatingHeaderSizesAllocations(t *testing.T) {
+	// A header larger than the writer's buffer moves serialization to the
+	// retained buffer for good; alternating with small headers must not keep
+	// allocating.
+	var resp Response
+	resp.SetBodyString("x")
+	w := bufio.NewWriterSize(io.Discard, 1024)
+	small, large := "v", string(bytes.Repeat([]byte("v"), 1500))
+	pair := func() {
+		for _, v := range []string{small, large} {
+			resp.Header.Set("X-Pad", v)
+			if err := resp.Write(w); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for range 10 {
+		pair()
+	}
+	if n := testing.AllocsPerRun(100, pair); n > 0 {
+		t.Errorf("%v allocs per alternating pair, expecting 0", n)
+	}
+}
+
+func TestFixedSizeBodyStreamWriteAllocations(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 16*1024)
+	stringBody := string(body)
+	var reader bytes.Reader
+	var stringReader strings.Reader
+	for _, tc := range []struct {
+		name   string
+		stream io.Reader
+	}{
+		{"bytes", &reader},
+		{"strings", &stringReader},
+		{"read-only", struct{ io.Reader }{&reader}},
+	} {
+		for _, request := range []bool{true, false} {
+			name := "response/" + tc.name
+			if request {
+				name = "request/" + tc.name
+			}
+			t.Run(name, func(t *testing.T) {
+				var req Request
+				req.Header.SetHost("example.com")
+				req.Header.SetMethod(MethodPost)
+				var resp Response
+				w := bufio.NewWriter(io.Discard)
+				write := func() {
+					reader.Reset(body)
+					stringReader.Reset(stringBody)
+					var err error
+					if request {
+						req.SetBodyStream(tc.stream, len(body))
+						err = req.Write(w)
+					} else {
+						resp.SetBodyStream(tc.stream, len(body))
+						err = resp.Write(w)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := w.Flush(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if n := testing.AllocsPerRun(100, write); n > 0 {
+					t.Errorf("%v allocs per fixed-size stream write, expecting 0", n)
+				}
+			})
+		}
+	}
+}
+
+func TestRequestBodyStreamWarning(t *testing.T) {
+	var r Request
+	tl := &testLogger{}
+	r.logger = tl
+
+	s := "test stream content"
+	r.SetBodyStream(bytes.NewBufferString(s), len(s))
+
+	body := r.Body()
+	if string(body) != s {
+		t.Fatalf("unexpected body %q", body)
+	}
+
+	tl.lock.Lock()
+	out := tl.out
+	tl.lock.Unlock()
+
+	expectedWarning := "Request.Body() reads the entire stream into memory. " +
+		"Use Request.BodyStream() or Request.BodyWriteTo() instead to avoid out-of-memory errors.\n"
+	if out != expectedWarning {
+		t.Fatalf("unexpected log message: got %q, want %q", out, expectedWarning)
 	}
 }

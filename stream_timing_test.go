@@ -63,8 +63,32 @@ func benchmarkStreamReader(b *testing.B, size int) {
 			if err != nil {
 				b.Fatalf("unexpected error from stream reader: %v", err)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(testTimeout(time.Second)):
 			b.Fatalf("timeout")
 		}
 	})
+}
+
+// BenchmarkNewStreamReader measures a stream carrying one small body, as
+// streamed request and response bodies do.
+func BenchmarkNewStreamReader(b *testing.B) {
+	src := createFixedBody(100)
+	dst := make([]byte, 4096)
+	b.ReportAllocs()
+	for b.Loop() {
+		sr := NewStreamReader(func(w *bufio.Writer) {
+			w.Write(src) //nolint:errcheck
+		})
+		for {
+			if _, err := sr.Read(dst); err != nil {
+				if err != io.EOF {
+					b.Fatalf("unexpected error: %v", err)
+				}
+				break
+			}
+		}
+		if err := sr.Close(); err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+	}
 }

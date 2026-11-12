@@ -2,9 +2,11 @@ package fasthttp
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -45,7 +47,7 @@ func TestURIAcquireReleaseConcurrent(t *testing.T) {
 	for range 10 {
 		select {
 		case <-ch:
-		case <-time.After(time.Second):
+		case <-time.After(testTimeout(time.Second)):
 			t.Fatalf("timeout")
 		}
 	}
@@ -112,6 +114,11 @@ func TestURIRejectInvalidIPv6(t *testing.T) {
 		"http://[2001:db8::vulndetector.com]/",
 		"http://[vulndetector.com]/",
 		"http://[::ffff:192.0.2.300]/",
+		"http://[abc%25en0]/",
+		"http://[gggg::1%25en0]/",
+		"http://[1.2.3.4%25en0]/",
+		"http://[%25en0]/",
+		"http://[::1%25]/",
 	} {
 		var u URI
 		if err := u.Parse(nil, []byte(raw)); err == nil {
@@ -122,6 +129,9 @@ func TestURIRejectInvalidIPv6(t *testing.T) {
 	for _, raw := range []string{
 		"http://[2001:db8::1]/",
 		"http://[fe80::1%25en0]/",
+		"http://[fe80::1%25en0]:8080/",
+		"http://[fe80::1%25%5Den0]:8080/",
+		"http://[::ffff:192.0.2.1%25en0]/",
 		"http://[::ffff:192.0.2.1]/",
 	} {
 		var u URI
@@ -201,6 +211,20 @@ func TestURIUpdate(t *testing.T) {
 	testURIUpdate(t, "http://example.net/dir/path1.html", "//example.com/dir/path2.html", "http://example.com/dir/path2.html")
 	// host with port
 	testURIUpdate(t, "http://example.net/", "//example.com:8080/", "http://example.com:8080/")
+
+	// "//" that isn't preceded by a scheme stays part of the reference
+	testURIUpdate(t, "http://example.net/dir/path1.html", "https//example.com/x", "http://example.net/dir/https/example.com/x")
+	testURIUpdate(t, "http://example.net/dir/path1.html", "a//b", "http://example.net/dir/a/b")
+	testURIUpdate(t, "http://example.net/dir/path1.html", "/a//b", "http://example.net/a/b")
+	testURIUpdate(t, "http://example.net/dir/path1.html?p=1", "?q=//example.com", "http://example.net/dir/path1.html?q=//example.com")
+
+	// same scheme as the base without "//" is a relative reference
+	testURIUpdate(t, "http://example.com/a/b/c?p=1", "http:g", "http://example.com/a/b/g")
+	testURIUpdate(t, "http://example.com/a/b/c?p=1", "HTTP:g?q=2#h", "http://example.com/a/b/g?q=2#h")
+	testURIUpdate(t, "https://example.com/a/b/c?p=1", "https:/g", "https://example.com/g")
+	testURIUpdate(t, "http://example.com/a/b/c?p=1", "http:?q=2", "http://example.com/a/b/c?q=2")
+	testURIUpdate(t, "http://example.com/a/b/c?p=1", "http:#h", "http://example.com/a/b/c?p=1#h")
+	testURIUpdate(t, "http://example.com/a/b/c?p=1", "http:", "http://example.com/a/b/c?p=1")
 }
 
 func TestURIRejectsMixedBracketHost(t *testing.T) {
@@ -219,6 +243,17 @@ func TestURIRejectsMixedBracketHost(t *testing.T) {
 	}
 }
 
+func TestHostShouldEscapeTable(t *testing.T) {
+	t.Parallel()
+
+	for c := range 256 {
+		exp := c < 0x80 && shouldEscape(byte(c), encodeHost)
+		if got := hostShouldEscapeTable[c] != 0; got != exp {
+			t.Fatalf("unexpected table entry for %#x: %v. Expecting %v", c, got, exp)
+		}
+	}
+}
+
 func testURIUpdate(t *testing.T, base, update, result string) {
 	var u URI
 	u.Parse(nil, []byte(base)) //nolint:errcheck
@@ -226,6 +261,81 @@ func testURIUpdate(t *testing.T, base, update, result string) {
 	s := u.String()
 	if s != result {
 		t.Fatalf("unexpected result %q. Expecting %q. base=%q, update=%q", s, result, base, update)
+	}
+
+	// UpdateBytesErr resolves the same way and has no error to report for an
+	// update that Update could apply.
+	var e URI
+	e.Parse(nil, []byte(base)) //nolint:errcheck
+	if err := e.UpdateBytesErr([]byte(update)); err != nil {
+		t.Fatalf("unexpected error: %v. base=%q, update=%q", err, base, update)
+	}
+	if s := e.String(); s != result {
+		t.Fatalf("unexpected result %q from UpdateBytesErr. Expecting %q. base=%q, update=%q", s, result, base, update)
+	}
+}
+
+func TestURIUpdateBytesErr(t *testing.T) {
+	t.Parallel()
+
+	const base = "http://example.com/dir/path1.html?param1=val1#fragment1"
+
+	tests := []struct {
+		name   string
+		update string
+		// absolute is set when update goes through Parse as is, so the error
+		// has to be the one Parse returns for it.
+		absolute bool
+		// invalidURI is set for the errors that are ErrorInvalidURI itself.
+		invalidURI bool
+	}{
+		{name: "control character in a full uri", update: "http://example.net/a\tb", absolute: true, invalidURI: true},
+		{name: "control character in a uri without scheme", update: "//example.net/a\tb", absolute: true, invalidURI: true},
+		{name: "control character in the scheme", update: "ht\ttp://example.net/", absolute: true, invalidURI: true},
+		{name: "control character in a request uri", update: "/a\tb", invalidURI: true},
+		{name: "control character in a relative path", update: "a\tb", invalidURI: true},
+		{name: "control character in a query string only update", update: "?a\tb", invalidURI: true},
+		{name: "control character in a hash only update", update: "#a\tb", invalidURI: true},
+		{name: "NUL", update: "/a\x00b", invalidURI: true},
+		{name: "CR", update: "/a\rb", invalidURI: true},
+		{name: "LF", update: "/a\nb", invalidURI: true},
+		{name: "DEL", update: "/a\x7fb", invalidURI: true},
+		{name: "space in the userinfo", update: "http://us er@example.net/", absolute: true, invalidURI: true},
+		{name: "invalid port", update: "http://example.net:abc/", absolute: true},
+		{name: "invalid port without scheme", update: "//example.net:abc/", absolute: true},
+		{name: "unclosed bracket in the host", update: "http://[::1/", absolute: true},
+		{name: "space in the host", update: "http://exa mple.net/", absolute: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var u URI
+			if err := u.Parse(nil, []byte(base)); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			err := u.UpdateBytesErr([]byte(tt.update))
+			if err == nil {
+				t.Fatalf("expecting an error for %q. Got the uri %q", tt.update, u.String())
+			}
+			if tt.invalidURI && !errors.Is(err, ErrorInvalidURI) {
+				t.Fatalf("unexpected error %q for %q. Expecting %q", err, tt.update, ErrorInvalidURI)
+			}
+			if tt.absolute {
+				var p URI
+				perr := p.Parse(nil, []byte(tt.update))
+				if perr == nil || perr.Error() != err.Error() {
+					t.Fatalf("unexpected error %q for %q. Expecting the one of Parse: %v", err, tt.update, perr)
+				}
+			}
+
+			// The uri is usable again once it is reset.
+			u.Reset()
+			u.Update(base)
+			if got := u.String(); got != base {
+				t.Fatalf("unexpected uri %q after reusing the uri. Expecting %q", got, base)
+			}
+		})
 	}
 }
 
@@ -264,6 +374,35 @@ func TestURIAllowAtInUserinfo(t *testing.T) {
 
 	if got := string(u.Password()); got != "p@ss" {
 		t.Fatalf("unexpected password %q", got)
+	}
+}
+
+func TestURIUserinfoPercentDecode(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		uri, username, password string
+	}{
+		{"http://user:p%40ss@example.com/", "user", "p@ss"},
+		{"http://us%3Aer:p%2F%3F%23ss@example.com/", "us:er", "p/?#ss"},
+		{"http://user:Passw0rd%21@example.com/", "user", "Passw0rd!"},
+		{"http://us%20er@example.com/", "us er", ""},
+		{"http://user:a+b@example.com/", "user", "a+b"},
+		{"http://user:%zz%4@example.com/", "user", "%zz%4"},
+	} {
+		var u URI
+		if err := u.Parse(nil, []byte(tc.uri)); err != nil {
+			t.Fatalf("unexpected error parsing %q: %v", tc.uri, err)
+		}
+		if got := string(u.Host()); got != "example.com" {
+			t.Fatalf("unexpected host %q for %q", got, tc.uri)
+		}
+		if got := string(u.Username()); got != tc.username {
+			t.Fatalf("unexpected username %q for %q. Expecting %q", got, tc.uri, tc.username)
+		}
+		if got := string(u.Password()); got != tc.password {
+			t.Fatalf("unexpected password %q for %q. Expecting %q", got, tc.uri, tc.password)
+		}
 	}
 }
 
@@ -319,6 +458,66 @@ func TestURIPathNormalize(t *testing.T) {
 	testURIPathNormalize(t, &u, "./foo/", "/foo/")
 	testURIPathNormalize(t, &u, "./../.././../../aaa/bbb/../../../././../", "/")
 	testURIPathNormalize(t, &u, "./a/./.././../b/./foo.html", "/b/foo.html")
+
+	// long runs of separators and dot segments, removed in one pass
+	testURIPathNormalize(t, &u, "/a"+strings.Repeat("/", 64)+"b", "/a/b")
+	testURIPathNormalize(t, &u, strings.Repeat("/", 64), "/")
+	testURIPathNormalize(t, &u, strings.Repeat("/.", 64)+"/a", "/a")
+	testURIPathNormalize(t, &u, strings.Repeat("/..", 64)+"/a", "/a")
+	testURIPathNormalize(t, &u, "/a"+strings.Repeat("/b/..", 64)+"/c", "/a/c")
+	testURIPathNormalize(t, &u, "/a"+strings.Repeat("/./b/../", 64), "/a/")
+
+	// trailing single dot, see RFC 3986 section 5.2.4 step 2B
+	testURIPathNormalize(t, &u, "/.", "/")
+	testURIPathNormalize(t, &u, "/aaa/.", "/aaa/")
+	testURIPathNormalize(t, &u, "/aaa/bbb/.", "/aaa/bbb/")
+	testURIPathNormalize(t, &u, "/aaa/./.", "/aaa/")
+	testURIPathNormalize(t, &u, "/aaa/../.", "/")
+	testURIPathNormalize(t, &u, "/a.b/.", "/a.b/")
+	testURIPathNormalize(t, &u, "/aaa%2F.", "/aaa/")
+
+	// a segment of more than one dot is an ordinary segment
+	testURIPathNormalize(t, &u, "/aaa/...", "/aaa/...")
+	testURIPathNormalize(t, &u, "/aaa/.b", "/aaa/.b")
+
+	// dots that don't start a segment leave the path as it is
+	testURIPathNormalize(t, &u, "/file.txt", "/file.txt")
+	testURIPathNormalize(t, &u, "/static/js/app.min.js", "/static/js/app.min.js")
+	testURIPathNormalize(t, &u, "/v1.2/a..b/c.", "/v1.2/a..b/c.")
+	testURIPathNormalize(t, &u, "/a%2E%2Eb/c%2Ed", "/a..b/c.d")
+	testURIPathNormalize(t, &u, "/.well-known/x.json", "/.well-known/x.json")
+
+	// dot segments that only decoding or slash removal brings out
+	testURIPathNormalize(t, &u, "/a%2F%2E%2E/b.c", "/b.c")
+	testURIPathNormalize(t, &u, "/a//.//b.c", "/a/b.c")
+}
+
+// normalizePath skips removeDotSegments for a path without a separator
+// followed by a dot; running it anyway must not change any result.
+func TestNormalizePathDotSegmentShortcut(t *testing.T) {
+	t.Parallel()
+
+	allSteps := func(src []byte) []byte {
+		dst := addLeadingSlash(nil, src)
+		dst = decodeArgAppendNoPlus(dst, src)
+		return removeDotSegments(removeSegments(dst, strSlashSlash))
+	}
+	var src []byte
+	var walk func(n int)
+	walk = func(n int) {
+		if got, want := normalizePath(nil, src), allSteps(src); !bytes.Equal(got, want) {
+			t.Fatalf("normalizePath(%q) = %q, want %q", src, got, want)
+		}
+		if n == 0 {
+			return
+		}
+		for _, c := range []byte(`/\.a%2EF`) {
+			src = append(src, c)
+			walk(n - 1)
+			src = src[:len(src)-1]
+		}
+	}
+	walk(6)
 }
 
 func testURIPathNormalize(t *testing.T, u *URI, requestURI, expectedPath string) {
@@ -612,5 +811,173 @@ func TestFragmentInHost(t *testing.T) {
 
 	if got := string(u.Host()); got != "google.com" {
 		t.Fatalf("Unexpected host %q. Expected %q", got, "google.com")
+	}
+}
+
+func TestURIRequestURIEmptyPathWithQuery(t *testing.T) {
+	t.Parallel()
+
+	var u URI
+	if err := u.Parse(nil, []byte("http://example.com?foo=bar")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := string(u.RequestURI()); got != "/?foo=bar" {
+		t.Fatalf("unexpected RequestURI %q. Expecting %q", got, "/?foo=bar")
+	}
+
+	u.DisablePathNormalizing = true
+	if got := string(u.RequestURI()); got != "/?foo=bar" {
+		t.Fatalf("unexpected RequestURI with DisablePathNormalizing %q. Expecting %q", got, "/?foo=bar")
+	}
+}
+
+func TestURIRequestURIBytes(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		uri        string
+		normalized string
+		original   string
+	}{
+		// An authority-form CONNECT target is parsed as a path without a
+		// leading slash.
+		{uri: "example.com:443", normalized: "/example.com:443", original: "example.com:443"},
+		{uri: "[2001:db8::1]:443", normalized: "/%5B2001:db8::1%5D:443", original: "[2001:db8::1]:443"},
+		{uri: "//example.com:443", normalized: "/example.com:443", original: "//example.com:443"},
+		{uri: "/a//b/../c?x=y", normalized: "/a/c?x=y", original: "/a//b/../c?x=y"},
+		{uri: "", normalized: "/", original: "/"},
+	} {
+		t.Run(tc.uri, func(t *testing.T) {
+			t.Parallel()
+
+			var u URI
+			if err := u.Parse([]byte("example.com:443"), []byte(tc.uri)); err != nil {
+				t.Fatal(err)
+			}
+
+			// The argument decides the normalization, whatever
+			// DisablePathNormalizing holds.
+			for _, disable := range []bool{false, true} {
+				u.DisablePathNormalizing = disable
+				if got := string(u.requestURIBytes(false)); got != tc.normalized {
+					t.Fatalf("unexpected normalized request uri with DisablePathNormalizing=%v %q. Expecting %q", disable, got, tc.normalized)
+				}
+				if got := string(u.requestURIBytes(true)); got != tc.original {
+					t.Fatalf("unexpected original request uri with DisablePathNormalizing=%v %q. Expecting %q", disable, got, tc.original)
+				}
+			}
+
+			// RequestURI keeps following DisablePathNormalizing.
+			u.DisablePathNormalizing = false
+			if got := string(u.RequestURI()); got != tc.normalized {
+				t.Fatalf("unexpected RequestURI %q. Expecting %q", got, tc.normalized)
+			}
+			u.DisablePathNormalizing = true
+			if got := string(u.RequestURI()); got != tc.original {
+				t.Fatalf("unexpected RequestURI with DisablePathNormalizing %q. Expecting %q", got, tc.original)
+			}
+		})
+	}
+}
+
+func TestURIRequestURIAfterDeletingAllQueryArgs(t *testing.T) {
+	t.Parallel()
+
+	var u URI
+	if err := u.Parse(nil, []byte("http://example.com/path?a=1")); err != nil {
+		t.Fatal(err)
+	}
+
+	u.QueryArgs().Del("a")
+
+	if got := string(u.RequestURI()); got != "/path" {
+		t.Fatalf("unexpected RequestURI %q; want %q", got, "/path")
+	}
+}
+
+func TestURIRequestURIAfterResettingQueryArgs(t *testing.T) {
+	t.Parallel()
+
+	var u URI
+	if err := u.Parse(nil, []byte("http://example.com/path?a=1&b=2")); err != nil {
+		t.Fatal(err)
+	}
+
+	u.QueryArgs().Reset()
+
+	if got := string(u.RequestURI()); got != "/path" {
+		t.Fatalf("unexpected RequestURI %q; want %q", got, "/path")
+	}
+}
+
+func TestURIParseSchemeInQueryKeepsOriginForm(t *testing.T) {
+	t.Parallel()
+
+	// "://" in the query of an origin-form target must not turn it into an
+	// absolute URI; a target with two leading slashes still carries one.
+	var u URI
+	if err := u.Parse([]byte("a"), []byte("/x?u=a://b")); err != nil {
+		t.Fatal(err)
+	}
+	if string(u.Host()) != "a" || string(u.Path()) != "/x" || string(u.QueryString()) != "u=a://b" {
+		t.Fatalf("got host %q path %q query %q", u.Host(), u.Path(), u.QueryString())
+	}
+	if err := u.Parse([]byte("a"), []byte("//host/p?u=a://b")); err != nil {
+		t.Fatal(err)
+	}
+	if string(u.Host()) != "host" || string(u.Path()) != "/p" || string(u.QueryString()) != "u=a://b" {
+		t.Fatalf("got host %q path %q query %q", u.Host(), u.Path(), u.QueryString())
+	}
+}
+
+func TestURIParseHostMemoAliasedArgument(t *testing.T) {
+	t.Parallel()
+
+	// Parse may be handed the URI's own host; the memo must key on the bytes
+	// as passed, not on what parseHost made of them in place.
+	var u URI
+	u.SetHost("%c3%b6.example")
+	if err := u.Parse(u.Host(), []byte("/")); err != nil {
+		t.Fatal(err)
+	}
+	if string(u.Host()) != "\xc3\xb6.example" {
+		t.Fatalf("host %q", u.Host())
+	}
+	if err := u.Parse([]byte("\xc3\xb6.examplemple"), []byte("/")); err != nil {
+		t.Fatal(err)
+	}
+	if string(u.Host()) != "\xc3\xb6.examplemple" {
+		t.Fatalf("host %q: the memo key was taken after the in-place rewrite", u.Host())
+	}
+	// A failed parse leaves no key behind.
+	if err := u.Parse([]byte("a b"), []byte("/")); err == nil {
+		t.Fatal("expected an error for an authority with a space")
+	}
+	if len(u.hostRaw) != 0 {
+		t.Fatalf("memo key %q retained after a failed parse", u.hostRaw)
+	}
+}
+
+func TestStringContainsCTLByteEveryPosition(t *testing.T) {
+	t.Parallel()
+
+	// Word-at-a-time scanning has to agree with the byte definition for every
+	// byte at every alignment: two full words plus a tail.
+	for c := range 256 {
+		want := c < 0x20 || c == 0x7f
+		for pos := range 21 {
+			s := bytes.Repeat([]byte{'a'}, 21)
+			s[pos] = byte(c)
+			if got := stringContainsCTLByte(s); got != want {
+				t.Fatalf("byte %#x at %d: got %v, want %v", c, pos, got, want)
+			}
+			if got := stringContainsCTLByte(s[:pos+1]); got != want {
+				t.Fatalf("byte %#x ending at %d: got %v, want %v", c, pos, got, want)
+			}
+		}
+	}
+	if stringContainsCTLByte(nil) {
+		t.Fatal("nil must not contain a CTL byte")
 	}
 }

@@ -3,9 +3,11 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/valyala/bytebufferpool"
@@ -258,6 +260,8 @@ func BenchmarkRemoveNewLines(b *testing.B) {
 		{value: "MaliciousValue\r\n", expectedValue: "MaliciousValue  "},
 		{value: "Malicious\nValue", expectedValue: "Malicious Value"},
 		{value: "Malicious\rValue", expectedValue: "Malicious Value"},
+		{value: strings.Repeat("LongValue", 12), expectedValue: strings.Repeat("LongValue", 12)},
+		{value: strings.Repeat("LongValue", 12) + "\r\n", expectedValue: strings.Repeat("LongValue", 12) + "  "},
 	}
 
 	for i, tcase := range testcases {
@@ -285,4 +289,89 @@ func BenchmarkRequestHeaderIsGet(b *testing.B) {
 			req.IsGet()
 		}
 	})
+}
+
+func BenchmarkRequestHeaderReadDrip(b *testing.B) {
+	// One byte per read: every retry must stay cheap until the block is in.
+	wire := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n")
+	for len(wire) < 4096 {
+		wire = append(wire, "X-Header-Name: some ordinary header value here\r\n"...)
+	}
+	wire = append(wire, "\r\n"...)
+	dr := &dripTestReader{data: wire}
+	br := bufio.NewReaderSize(dr, 16384)
+	var h RequestHeader
+	b.ReportAllocs()
+	for b.Loop() {
+		dr.pos = 0
+		br.Reset(dr)
+		if err := h.Read(br); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRequestHeaderReadTrailerAnnouncement(b *testing.B) {
+	// A Trailer field full of distinct names: recording the set must not
+	// cost a scan of every name already in it.
+	wire := []byte("GET / HTTP/1.1\r\nHost: example.com\r\nTrailer: X-T0")
+	for i := 1; len(wire) < 8192; i++ {
+		wire = fmt.Appendf(wire, ",X-T%d", i)
+	}
+	wire = append(wire, "\r\n\r\n"...)
+	dr := &benchReadBuf{s: wire}
+	br := bufio.NewReaderSize(dr, 16384)
+	var h RequestHeader
+	b.ReportAllocs()
+	for b.Loop() {
+		dr.n = 0
+		br.Reset(dr)
+		h.Reset()
+		if err := h.Read(br); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRequestReadTrailerSection(b *testing.B) {
+	// The same set, arriving as the trailer section of a chunked body.
+	wire := []byte("POST / HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n")
+	for i := 0; len(wire) < 8192; i++ {
+		wire = fmt.Appendf(wire, "X-T%d: v\r\n", i)
+	}
+	wire = append(wire, "\r\n"...)
+	dr := &benchReadBuf{s: wire}
+	br := bufio.NewReaderSize(dr, 16384)
+	var req Request
+	b.ReportAllocs()
+	for b.Loop() {
+		dr.n = 0
+		br.Reset(dr)
+		req.Reset()
+		if err := req.ReadLimitBody(br, 0); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRequestHeaderReadTrailerAnnouncementFields(b *testing.B) {
+	// The same set split over one Trailer field per name: the index has to
+	// survive the whole header parse, or every field rebuilds it.
+	wire := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n")
+	for i := 0; len(wire) < 8192; i++ {
+		wire = fmt.Appendf(wire, "Trailer: X-T%d\r\n", i)
+	}
+	wire = append(wire, "\r\n"...)
+	dr := &benchReadBuf{s: wire}
+	br := bufio.NewReaderSize(dr, 16384)
+	var h RequestHeader
+	b.ReportAllocs()
+	for b.Loop() {
+		dr.n = 0
+		br.Reset(dr)
+		h.Reset()
+		if err := h.Read(br); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
